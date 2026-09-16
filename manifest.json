@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "id": "ewe.passwords",
+  "name": "Passwords",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "description": "Fill a login from your password manager (1Password, Bitwarden, pass) into any window \u2014 Super+P.",
+  "homepage": "https://github.com/prj786/ewe-plugin-passwords",
+  "author": "prj786",
+  "kinds": [
+    "panel"
+  ],
+  "entryPoints": {
+    "panel": "Panel.qml"
+  },
+  "keybinds": [
+    {
+      "combo": "SUPER + P",
+      "ipc": "ewe.passwords toggle"
+    }
+  ],
+  "settings": [
+    {
+      "key": "provider",
+      "type": "choice",
+      "default": "auto",
+      "label": "Password manager",
+      "choices": [
+        "auto",
+        "1password",
+        "bitwarden",
+        "pass"
+      ]
+    },
+    {
+      "key": "press_enter",
+      "type": "bool",
+      "default": false,
+      "label": "Press Enter after the password"
+    }
+  ]
+}

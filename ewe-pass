@@ -1,0 +1,564 @@
+#!/usr/bin/env python3
+"""ewe-pass — credentials for the desktop's fill picker (Passwords.qml).
+
+Linux has no password-autofill standard and no manager fills into native
+apps on Wayland (1Password/Bitwarden copy only; KeePassXC/Proton Pass need a
+RemoteDesktop portal Hyprland lacks). So the SHELL does it: this tool reads
+the user's manager through its CLI and TYPES the credential into the focused
+window through a virtual keyboard (wtype). One JSON object per call, exit 0;
+problems are {"ok": false, "error": "...", "hint": "..."}. Secrets are never
+printed and never passed as arguments — they go to wtype / wl-copy on stdin.
+
+  status                          provider in use, whether it can answer
+  providers                       every provider and whether it is installed
+  match [--class C] [--title T] [--query Q] [--limit N] [--refresh]
+                                  items for the focused app, best first — no
+                                  secrets: {id, title, username, host, score,
+                                  reason}. Omit --class/--title to read the
+                                  active window from hyprctl.
+  fill <id> --pid PID [--what login|username|password] [--enter]
+                                  type into the window that owns PID (the one
+                                  the picker was opened on; --pid 0 skips the
+                                  check). login = username, Tab, password.
+  copy <id> --what username|password
+                                  wl-copy (cliphist skips it — see clip-store.sh)
+  remember <id> [--class C]       pin an item to an app class; it sorts first
+  forget <id> [--class C]
+
+Providers (ewe.conf [passwords] provider = auto | 1password | bitwarden | pass):
+  1password  `op` with the desktop app's CLI integration (Settings →
+             Developer → "Integrate with 1Password CLI"; unlock is the app's
+             own prompt, the vault password never enters ewe)
+  bitwarden  `rbw` (an unlocked agent) — list via `rbw list`, secret via
+             `rbw get --raw`
+  pass       ~/.password-store (`pass show`); first line = password,
+             `login:`/`username:`/`user:` line = username
+Matching: an item's URL host (discord.com → "discord") against the window
+class and title, the tag `app:<class>` on the item, a remembered pin, and the
+search text. Nothing matched → every item, alphabetically, so the search box
+still finds it.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+CONF_DIR = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
+RUN_DIR = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+PINS = os.path.join(CONF_DIR, "ewe", "passwords-apps.json")   # {class: [item ids]}
+CACHE_DIR = os.path.join(RUN_DIR, "ewe-pass")
+CACHE_TTL = 120          # s — the item LIST (titles, usernames, urls; no secrets)
+OP_TIMEOUT = 180         # s — the app's unlock prompt can wait for the user
+TYPE_DELAY_MS = 8
+
+
+def out(obj):
+    print(json.dumps(obj))
+
+
+def fail(error, hint="", code=1):
+    o = {"ok": False, "error": error}
+    if hint:
+        o["hint"] = hint
+    out(o)
+    sys.exit(code)
+
+
+def have(cmd):
+    from shutil import which
+    return which(cmd) is not None
+
+
+def conf(key, default=None):
+    """ewe.conf value through ewe-conf (the one reader); unset → default"""
+    try:
+        r = subprocess.run(["ewe-conf", "get", key], capture_output=True, text=True, timeout=5)
+        v = json.loads(r.stdout or "null")
+    except Exception:
+        return default
+    if isinstance(v, dict) and "error" in v:
+        return default
+    return default if v is None else v
+
+
+# ── providers ───────────────────────────────────────────────────────────────
+# each: name, installed(), ready() -> (ok, error, hint), items() -> [item],
+# secret(id) -> {username, password}; item = {id, title, username, urls, tags}
+
+class OnePassword:
+    name = "1password"
+    label = "1Password"
+
+    def installed(self):
+        return have("op")
+
+    def _run(self, args, timeout=OP_TIMEOUT):
+        r = subprocess.run(["op", *args, "--format", "json"], capture_output=True, text=True, timeout=timeout)
+        if r.returncode != 0:
+            # op's stderr is prose (several lines of advice); the first
+            # non-empty line is the actual error, minus its "[ERROR] <time>" stamp
+            err = [l.strip() for l in (r.stderr or r.stdout).splitlines() if l.strip()]
+            msg = re.sub(r"^\[ERROR\]\s*[\d/]+\s+[\d:]+\s*", "", err[0]) if err else "op failed"
+            hint = ""
+            low = msg.lower()
+            if "not signed in" in low or "no accounts" in low or "account" in low and "not found" in low \
+                    or "sign in" in low or "no account" in low:
+                hint = ("Turn on Settings → Developer → \"Integrate with 1Password CLI\" in the 1Password app "
+                        "(and Settings → Security → \"Unlock using system authentication\")")
+            elif "authorization" in low or "denied" in low or "locked" in low:
+                hint = "Unlock 1Password and approve the CLI in the prompt"
+            raise ProviderError(msg, hint)
+        return json.loads(r.stdout or "null")
+
+    def ready(self):
+        if not have("op"):
+            return False, "1password-cli isn't installed", "Install it with Komble (package 1password-cli)"
+        try:
+            accts = self._run(["account", "list"], timeout=20)
+        except ProviderError as e:
+            return False, e.error, e.hint
+        except subprocess.TimeoutExpired:
+            return False, "op did not answer", ""
+        if not accts:
+            return False, "1Password CLI is not connected to the app", (
+                "Turn on Settings → Developer → \"Integrate with 1Password CLI\" in the 1Password app")
+        return True, "", ""
+
+    def items(self):
+        raw = self._run(["item", "list", "--categories", "Login"]) or []
+        items = []
+        for it in raw:
+            urls = [u.get("href", "") for u in (it.get("urls") or []) if u.get("href")]
+            items.append({
+                "id": it.get("id", ""),
+                "title": it.get("title", ""),
+                "username": it.get("additional_information", "") or "",
+                "urls": urls,
+                "tags": it.get("tags") or [],
+            })
+        return items
+
+    def secret(self, item_id):
+        it = self._run(["item", "get", item_id]) or {}
+        user, pw = "", ""
+        for f in it.get("fields") or []:
+            p = (f.get("purpose") or "").upper()
+            if p == "USERNAME" and not user:
+                user = f.get("value") or ""
+            elif p == "PASSWORD" and not pw:
+                pw = f.get("value") or ""
+        return {"username": user, "password": pw}
+
+
+class Bitwarden:
+    name = "bitwarden"
+    label = "Bitwarden"
+
+    def installed(self):
+        return have("rbw")
+
+    def ready(self):
+        if not have("rbw"):
+            return False, "rbw isn't installed", "Install rbw (Bitwarden CLI agent) with Komble and run `rbw login`"
+        r = subprocess.run(["rbw", "unlocked"], capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return False, "Bitwarden vault is locked", "Run `rbw unlock` in a terminal"
+        return True, "", ""
+
+    def items(self):
+        r = subprocess.run(["rbw", "list", "--fields", "id,name,user,folder"], capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            raise ProviderError((r.stderr or "rbw list failed").strip(), "Run `rbw unlock` in a terminal")
+        items = []
+        for line in r.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            items.append({"id": parts[0], "title": parts[1], "username": parts[2], "urls": [], "tags": []})
+        return items
+
+    def secret(self, item_id):
+        # rbw resolves by NAME; the id is unique so pick the entry by id first
+        name = user = None
+        for it in self.items():
+            if it["id"] == item_id:
+                name, user = it["title"], it["username"]
+                break
+        if name is None:
+            raise ProviderError("item not found", "")
+        args = ["rbw", "get", "--raw", name] + ([user] if user else [])
+        r = subprocess.run(args, capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            raise ProviderError((r.stderr or "rbw get failed").strip(), "")
+        d = json.loads(r.stdout or "{}")
+        data = d.get("data") or {}
+        return {"username": data.get("username") or user or "", "password": data.get("password") or ""}
+
+
+class PassStore:
+    name = "pass"
+    label = "pass"
+    store = os.environ.get("PASSWORD_STORE_DIR") or os.path.join(HOME, ".password-store")
+
+    def installed(self):
+        return have("pass") and os.path.isdir(self.store)
+
+    def ready(self):
+        if not self.installed():
+            return False, "pass store not found", "Install pass and run `pass init`"
+        return True, "", ""
+
+    def items(self):
+        items = []
+        for root, _dirs, files in os.walk(self.store):
+            if "/.git" in root:
+                continue
+            for f in files:
+                if not f.endswith(".gpg"):
+                    continue
+                rel = os.path.relpath(os.path.join(root, f), self.store)[:-4]
+                title = rel.split("/")[-1]
+                user = rel.split("/")[-2] if "/" in rel else ""
+                items.append({"id": rel, "title": rel, "username": user, "urls": [title], "tags": []})
+        return items
+
+    def secret(self, item_id):
+        r = subprocess.run(["pass", "show", item_id], capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            raise ProviderError((r.stderr or "pass show failed").strip(), "")
+        lines = r.stdout.splitlines()
+        pw = lines[0] if lines else ""
+        user = ""
+        for l in lines[1:]:
+            m = re.match(r"^\s*(login|username|user)\s*:\s*(.+)$", l, re.I)
+            if m:
+                user = m.group(2).strip()
+                break
+        return {"username": user, "password": pw}
+
+
+class ProviderError(Exception):
+    def __init__(self, error, hint=""):
+        super().__init__(error)
+        self.error, self.hint = error, hint
+
+
+PROVIDERS = [OnePassword(), Bitwarden(), PassStore()]
+
+
+def pick_provider():
+    # the plugin hands its settings over as environment; ewe.conf [passwords] is the fallback
+    want = str(os.environ.get("EWE_PASS_PROVIDER") or conf("passwords.provider", "auto") or "auto").lower()
+    if want != "auto":
+        for p in PROVIDERS:
+            if p.name == want:
+                return p
+        fail("unknown provider %r in ewe.conf [passwords]" % want,
+             "provider = auto | 1password | bitwarden | pass")
+    for p in PROVIDERS:
+        if p.installed():
+            return p
+    fail("no password manager CLI found",
+         "Install 1password-cli (and connect it in the 1Password app), rbw, or pass")
+
+
+# ── item list cache (no secrets: titles, usernames, hosts) ──────────────────
+
+def cached_items(p, refresh=False):
+    os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
+    path = os.path.join(CACHE_DIR, p.name + ".json")
+    if not refresh:
+        try:
+            st = os.stat(path)
+            if time.time() - st.st_mtime < CACHE_TTL:
+                with open(path) as f:
+                    return json.load(f)
+        except (OSError, ValueError):
+            pass
+    items = p.items()
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(items, f)
+    os.replace(tmp, path)
+    return items
+
+
+# ── matching ────────────────────────────────────────────────────────────────
+
+def host_token(url):
+    """https://www.discord.com/login → ('discord.com', 'discord')"""
+    u = url.strip()
+    if "://" not in u:
+        u = "https://" + u
+    m = re.match(r"^[a-z]+://([^/:?#]+)", u, re.I)
+    if not m:
+        return "", ""
+    host = m.group(1).lower()
+    if host.startswith("www."):
+        host = host[4:]
+    parts = host.split(".")
+    if len(parts) >= 3 and parts[-2] in ("co", "com", "org", "net", "ac", "gov") and len(parts[-1]) == 2:
+        token = parts[-3]
+    elif len(parts) >= 2:
+        token = parts[-2]
+    else:
+        token = parts[0]
+    return host, token
+
+
+def load_pins():
+    try:
+        with open(PINS) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_pins(d):
+    os.makedirs(os.path.dirname(PINS), exist_ok=True)
+    tmp = PINS + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(d, f, indent=2, sort_keys=True)
+    os.replace(tmp, PINS)
+
+
+def active_window():
+    try:
+        r = subprocess.run(["hyprctl", "activewindow", "-j"], capture_output=True, text=True, timeout=5)
+        w = json.loads(r.stdout or "{}")
+    except Exception:
+        return {}
+    return w if isinstance(w, dict) else {}
+
+
+def score_items(items, wclass, title, query, pins):
+    wc = (wclass or "").lower()
+    wt = (title or "").lower()
+    q = (query or "").lower().strip()
+    pinned = set(pins.get(wc, []) or []) if wc else set()
+    # words of the class/title worth matching an item title against
+    words = [w for w in re.split(r"[^a-z0-9]+", wc + " " + wt) if len(w) >= 3]
+    out_items = []
+    for it in items:
+        s, why = 0, ""
+        tl = (it.get("title") or "").lower()
+        if it["id"] in pinned:
+            s, why = 50, "pinned to this app"
+        for t in it.get("tags") or []:
+            if isinstance(t, str) and t.lower() == "app:" + wc and wc:
+                s, why = max(s, 40), why or "tagged app:" + wc
+        best_host = ""
+        for u in it.get("urls") or []:
+            host, tok = host_token(u)
+            if not best_host:
+                best_host = host
+            if tok and len(tok) >= 3:
+                if wc and tok in wc:
+                    s, why = max(s, 30), why or "site matches the app"
+                elif wt and tok in wt:
+                    s, why = max(s, 20), why or "site matches the window title"
+        if wc and len(wc) >= 3 and (wc in tl or (tl and tl in wc)):
+            s, why = max(s, 25), why or "title matches the app"
+        elif tl and any(w in tl for w in words if len(w) >= 4 and w not in ("window", "login", "sign")):
+            s, why = max(s, 10), why or "title matches the window"
+        if q:
+            hay = " ".join([tl, (it.get("username") or "").lower(), best_host])
+            if q not in hay:
+                continue
+            s += 5
+        out_items.append({"id": it["id"], "title": it.get("title", ""), "username": it.get("username", ""),
+                          "host": best_host, "score": s, "reason": why})
+    out_items.sort(key=lambda x: (-x["score"], x["title"].lower()))
+    return out_items
+
+
+# ── typing ──────────────────────────────────────────────────────────────────
+
+def wtype(argv, text=None):
+    if not have("wtype"):
+        raise ProviderError("wtype isn't installed", "sudo pacman -S wtype")
+    r = subprocess.run(["wtype", *argv], input=text, capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        raise ProviderError("typing failed: " + (r.stderr or "wtype error").strip(), "")
+
+
+def type_sequence(sec, what, enter, delay_ms):
+    d = ["-d", str(delay_ms)]
+    if what in ("login", "username"):
+        wtype([*d, "-"], sec.get("username", ""))
+    if what == "login":
+        wtype(["-k", "Tab"])
+    if what in ("login", "password"):
+        wtype([*d, "-"], sec.get("password", ""))
+    if enter:
+        wtype(["-k", "Return"])
+
+
+# ── verbs ───────────────────────────────────────────────────────────────────
+
+def arg(argv, name, default=None):
+    if name in argv:
+        i = argv.index(name)
+        if i + 1 < len(argv):
+            return argv[i + 1]
+    return default
+
+
+def cmd_status():
+    p = pick_provider()
+    ok, err, hint = p.ready()
+    o = {"ok": True, "provider": p.name, "label": p.label, "ready": ok}
+    if not ok:
+        o["error"], o["hint"] = err, hint
+    out(o)
+
+
+def cmd_providers():
+    cur = pick_provider()
+    out({"ok": True, "current": cur.name,
+         "providers": [{"name": p.name, "label": p.label, "installed": p.installed()} for p in PROVIDERS]})
+
+
+def cmd_match(argv):
+    p = pick_provider()
+    wclass, title = arg(argv, "--class"), arg(argv, "--title")
+    if wclass is None and title is None:
+        w = active_window()
+        wclass, title = w.get("class", ""), w.get("title", "")
+    limit = int(arg(argv, "--limit", "0") or 0)
+    try:
+        items = cached_items(p, refresh="--refresh" in argv)
+    except ProviderError as e:
+        ok, err, hint = p.ready()      # a clearer reason than the raw CLI error, if there is one
+        fail(err if not ok and err else e.error, hint if not ok and hint else e.hint)
+    except subprocess.TimeoutExpired:
+        fail("the password manager did not answer", "Unlock it and try again")
+    res = score_items(items, wclass, title, arg(argv, "--query", ""), load_pins())
+    if limit > 0:
+        res = res[:limit]
+    out({"ok": True, "provider": p.name, "label": p.label, "class": wclass or "", "title": title or "",
+         "matched": sum(1 for r in res if r["score"] > 0), "items": res})
+
+
+def cmd_fill(argv):
+    if len(argv) < 2 or argv[1].startswith("--"):
+        fail("fill needs an item id")
+    item_id = argv[1]
+    pid = int(arg(argv, "--pid", "0") or 0)
+    what = arg(argv, "--what", "login")
+    if what not in ("login", "username", "password"):
+        fail("--what must be login, username or password")
+    env_enter = os.environ.get("EWE_PASS_ENTER")
+    enter = "--enter" in argv or (what == "login" and (env_enter == "1" if env_enter in ("0", "1") else bool(conf("passwords.press_enter", False))))
+    delay = int(conf("passwords.type_delay_ms", TYPE_DELAY_MS) or TYPE_DELAY_MS)
+    p = pick_provider()
+    try:
+        sec = p.secret(item_id)
+    except ProviderError as e:
+        fail(e.error, e.hint)
+    except subprocess.TimeoutExpired:
+        fail("the password manager did not answer", "Unlock it and try again")
+    if what != "password" and not sec.get("username") and what == "login":
+        what = "password"          # an item with no username: just the password
+    # the picker closes before calling us; give the compositor a moment to hand
+    # focus back, then make sure it went to the window the picker was opened on
+    time.sleep(0.15)
+    if pid:
+        deadline = time.time() + 1.5
+        while True:
+            w = active_window()
+            if int(w.get("pid", 0) or 0) == pid:
+                break
+            if time.time() > deadline:
+                fail("focus moved to another window — nothing was typed",
+                     "Click into the field and press the fill key again")
+            time.sleep(0.1)
+    try:
+        type_sequence(sec, what, enter, delay)
+    except ProviderError as e:
+        fail(e.error, e.hint)
+    out({"ok": True, "typed": what, "enter": enter})
+
+
+def cmd_copy(argv):
+    if len(argv) < 2 or argv[1].startswith("--"):
+        fail("copy needs an item id")
+    what = arg(argv, "--what", "password")
+    if what not in ("username", "password"):
+        fail("--what must be username or password")
+    if not have("wl-copy"):
+        fail("wl-clipboard isn't installed")
+    p = pick_provider()
+    try:
+        sec = p.secret(argv[1])
+    except ProviderError as e:
+        fail(e.error, e.hint)
+    # tell the clipboard-history gate (clip-store.sh) to let this one pass by
+    try:
+        with open(os.path.join(RUN_DIR, "ewe-clip-skip"), "w") as f:
+            f.write(what)
+    except OSError:
+        pass
+    r = subprocess.run(["wl-copy", "--"], input=sec.get(what, ""), text=True, capture_output=True)
+    if r.returncode != 0:
+        fail("wl-copy failed: " + (r.stderr or "").strip())
+    out({"ok": True, "copied": what})
+
+
+def cmd_pin(argv, add):
+    if len(argv) < 2 or argv[1].startswith("--"):
+        fail("%s needs an item id" % argv[0])
+    wclass = arg(argv, "--class") or active_window().get("class", "")
+    if not wclass:
+        fail("no app class to pin to")
+    wc = wclass.lower()
+    pins = load_pins()
+    lst = [i for i in (pins.get(wc) or []) if i != argv[1]]
+    if add:
+        lst.insert(0, argv[1])
+    if lst:
+        pins[wc] = lst
+    else:
+        pins.pop(wc, None)
+    save_pins(pins)
+    out({"ok": True, "class": wc, "pinned": lst})
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    v = argv[0]
+    try:
+        if v == "status":
+            cmd_status()
+        elif v == "providers":
+            cmd_providers()
+        elif v == "match":
+            cmd_match(argv)
+        elif v == "fill":
+            cmd_fill(argv)
+        elif v == "copy":
+            cmd_copy(argv)
+        elif v == "remember":
+            cmd_pin(argv, True)
+        elif v == "forget":
+            cmd_pin(argv, False)
+        else:
+            fail("unknown verb %r" % v, code=2)
+    except SystemExit:
+        raise
+    except Exception as e:  # one JSON line, never a traceback, for the shell
+        out({"ok": False, "error": str(e)})
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
