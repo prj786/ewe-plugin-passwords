@@ -170,16 +170,22 @@ Scope {
 
         Rectangle {
             id: panel
-            width: 500
-            height: col.implicitHeight + 28
+            // a solid panel (Launcher panel card): surfaceRaised, a
+            // borderSubtle outline, radiusRounded; wider with Text size
+            width: Theme.grow(Theme.panelLg)
+            height: col.implicitHeight + 2 * (Theme.spaceS + Theme.spaceXs)
             anchors.horizontalCenter: parent.horizontalCenter
             y: Math.round(parent.height * 0.24)
-            radius: Theme.radius
-            color: Theme.panel
+            radius: Theme.radiusRounded
+            color: Theme.surfaceRaised
+            border.color: Theme.borderSubtle; border.width: Theme.borderWidth1
+            // fade plus a slideOffset lift, in at durBase and out at durFast
             opacity: root.open ? 1 : 0
-            scale: root.open ? 1 : 0.97
-            Behavior on opacity { NumberAnimation { duration: Theme.durSlow; easing.type: Theme.ease } }
-            Behavior on scale   { NumberAnimation { duration: Theme.durSlow; easing.type: Theme.ease } }
+            Behavior on opacity { NumberAnimation { duration: root.open ? Theme.durBase : Theme.durFast; easing.type: Theme.ease } }
+            transform: Translate {
+                y: (root.open || Theme.reduceMotion) ? 0 : Theme.slideOffset
+                Behavior on y { NumberAnimation { duration: Theme.durBase; easing.type: Theme.ease } }
+            }
             layer.enabled: true
             layer.effect: Elevation {}
             MouseArea { anchors.fill: parent }   // swallow
@@ -187,46 +193,49 @@ Scope {
             Column {
                 id: col
                 anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top
-                anchors.margins: 14
-                spacing: 10
+                anchors.margins: Theme.spaceS + Theme.spaceXs
+                spacing: Theme.spaceS
 
                 // ── header: what we fill into, from where ──
                 Item {
-                    width: parent.width; height: 22
+                    width: parent.width; height: Math.max(Theme.iconMd, Theme.type.bodyStrong.lineHeight)
                     Text {
                         id: hdrIcon
                         anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter
-                        text: Theme.icLock; font.family: Theme.fontIcons; font.pixelSize: 14; color: Theme.accent
+                        text: Theme.icLock; font.family: Theme.fontIcons; font.pixelSize: Theme.iconMd; color: Theme.accentText
                     }
                     Text {
-                        anchors.left: hdrIcon.right; anchors.leftMargin: 8
-                        anchors.right: prov.left; anchors.rightMargin: 8
+                        anchors.left: hdrIcon.right; anchors.leftMargin: Theme.spaceS
+                        anchors.right: prov.left; anchors.rightMargin: Theme.spaceS
                         anchors.verticalCenter: parent.verticalCenter
                         text: root.target.title ? "Fill into " + root.target.title : "Fill into the focused window"
-                        color: Theme.fg1; font.family: Theme.fontText; font.pixelSize: Theme.fsBody; font.weight: Font.DemiBold
+                        color: Theme.textPrimary
+                        font.family: Theme.type.bodyStrong.family; font.pixelSize: Theme.type.bodyStrong.size; font.weight: Theme.type.bodyStrong.weight
                         elide: Text.ElideRight
                     }
                     Text {
                         id: prov
                         anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
                         text: root.providerLabel
-                        color: Theme.fg3; font.family: Theme.fontText; font.pixelSize: 11
+                        color: Theme.textMuted; font.family: Theme.type.caption.family; font.pixelSize: Theme.type.caption.size
                     }
                 }
 
-                // ── search ──
+                // ── search: the xl Search field (the launcher's) ──
                 Rectangle {
-                    width: parent.width; height: 36; radius: Theme.radiusControl
-                    color: Theme.bg3; border.color: input.activeFocus ? Theme.accent : Theme.stroke1; border.width: Theme.borderThin
-                    Text { anchors.left: parent.left; anchors.leftMargin: 11; anchors.verticalCenter: parent.verticalCenter; text: Theme.icSearch; font.family: Theme.fontIcons; font.pixelSize: 12; color: Theme.fg3 }
+                    width: parent.width; height: Theme.controlXl; radius: Theme.radiusPrimary
+                    color: Theme.surfaceSunken
+                    border.color: input.activeFocus ? Theme.focusRing : Theme.borderStrong
+                    border.width: Theme.fieldBorderWidth
+                    Text { id: searchIcon; anchors.left: parent.left; anchors.leftMargin: Theme.spaceS + Theme.spaceXs; anchors.verticalCenter: parent.verticalCenter; text: Theme.icSearch; font.family: Theme.fontIcons; font.pixelSize: Theme.iconLg; color: Theme.textMuted }
                     TextInput {
                         id: input
-                        anchors.fill: parent; anchors.leftMargin: 32; anchors.rightMargin: 10
+                        anchors.fill: parent; anchors.leftMargin: Theme.spaceS + Theme.spaceXs + Theme.iconLg + Theme.spaceS; anchors.rightMargin: Theme.spaceS + Theme.spaceXs
                         verticalAlignment: TextInput.AlignVCenter
-                        color: Theme.fg1; font.family: Theme.fontText; font.pixelSize: Theme.fsSmall
-                        selectionColor: Theme.accent; selectByMouse: true; clip: true
+                        color: Theme.textPrimary; font.family: Theme.type.bodyLg.family; font.pixelSize: Theme.type.bodyLg.size
+                        selectionColor: Theme.accent; selectedTextColor: Theme.onAccent; selectByMouse: true; clip: true
                         onTextChanged: { root.query = text; root.selected = 0 }
-                        Text { visible: input.text.length === 0; anchors.verticalCenter: parent.verticalCenter; text: "Search logins…"; color: Theme.fg3; font: input.font }
+                        Text { visible: input.text.length === 0; anchors.verticalCenter: parent.verticalCenter; text: "Search logins"; color: Theme.textMuted; font: input.font }
                         Keys.onPressed: function (ev) {
                             var ctrl = ev.modifiers & Qt.ControlModifier, shift = ev.modifiers & Qt.ShiftModifier
                             if (ev.key === Qt.Key_Escape) { root.open = false; ev.accepted = true }
@@ -239,13 +248,15 @@ Scope {
                     }
                 }
 
-                // ── list ──
+                // ── list: List rows, two lines each ──
                 ListView {
                     id: list
+                    // a row holds a body title over a caption username
+                    readonly property int rowH: Math.max(Theme.controlXl, Theme.type.body.lineHeight + Theme.type.caption.lineHeight + 2 * Theme.spaceXs)
                     width: parent.width
-                    height: root.results.length > 0 ? Math.min(root.results.length, 7) * 48 : 96
+                    height: root.results.length > 0 ? Math.min(root.results.length, 7) * (rowH + spacing) - spacing : 2 * Theme.control2xl
                     clip: true
-                    spacing: 4
+                    spacing: Theme.spaceXxs
                     model: root.results
                     currentIndex: root.selected
                     boundsBehavior: Flickable.StopAtBounds
@@ -254,30 +265,31 @@ Scope {
                         required property var modelData
                         required property int index
                         readonly property bool sel: index === root.selected
-                        width: list.width; height: 44
-                        radius: Theme.radiusControl
-                        color: sel ? Theme.card : (rowMa.containsMouse ? Theme.subtleHover : Theme.subtle)
-                        border.width: sel ? 1 : 0; border.color: Theme.accent
+                        width: list.width; height: list.rowH
+                        radius: Theme.radiusSecondary
+                        color: sel ? Theme.accentSubtle : rowMa.pressed ? Theme.surfacePressed : rowMa.containsMouse ? Theme.surfaceHover : "transparent"
                         Text {
                             id: glyph
-                            anchors.left: parent.left; anchors.leftMargin: 12; anchors.verticalCenter: parent.verticalCenter
+                            anchors.left: parent.left; anchors.leftMargin: Theme.spaceS; anchors.verticalCenter: parent.verticalCenter
                             text: modelData.reason === "pinned to this app" ? Theme.icPin : Theme.icUser
-                            font.family: Theme.fontIcons; font.pixelSize: 13; color: row.sel ? Theme.accent : Theme.fg3
+                            font.family: Theme.fontIcons; font.pixelSize: Theme.iconMd; color: row.sel ? Theme.accentText : Theme.textSecondary
                         }
                         Column {
-                            anchors.left: glyph.right; anchors.leftMargin: 12
-                            anchors.right: cap.left; anchors.rightMargin: 8
+                            anchors.left: glyph.right; anchors.leftMargin: Theme.spaceS + Theme.spaceXs
+                            anchors.right: cap.left; anchors.rightMargin: Theme.spaceS
                             anchors.verticalCenter: parent.verticalCenter
-                            spacing: 1
-                            Text { width: parent.width; text: modelData.title; color: Theme.fg1; font.family: Theme.fontText; font.pixelSize: Theme.fsSmall; font.weight: row.sel ? Font.DemiBold : Font.Normal; elide: Text.ElideRight }
-                            Text { width: parent.width; visible: modelData.username !== ""; text: modelData.username; color: Theme.fg3; font.family: Theme.fontText; font.pixelSize: 11; elide: Text.ElideRight }
+                            Text { width: parent.width; text: modelData.title; color: Theme.textPrimary
+                                   font.family: Theme.type.body.family; font.pixelSize: Theme.type.body.size
+                                   font.weight: row.sel ? Theme.fontWeightMedium : Theme.fontWeightRegular; elide: Text.ElideRight }
+                            Text { width: parent.width; visible: modelData.username !== ""; text: modelData.username; color: Theme.textMuted
+                                   font.family: Theme.type.caption.family; font.pixelSize: Theme.type.caption.size; elide: Text.ElideRight }
                         }
                         Text {
                             id: cap
-                            anchors.right: parent.right; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter
+                            anchors.right: parent.right; anchors.rightMargin: Theme.spaceS; anchors.verticalCenter: parent.verticalCenter
                             text: modelData.score > 0 ? modelData.reason : modelData.host
-                            color: modelData.score > 0 ? Theme.accent : Theme.fg3
-                            font.family: Theme.fontText; font.pixelSize: 10
+                            color: modelData.score > 0 ? Theme.accentText : Theme.textMuted
+                            font.family: Theme.type.caption.family; font.pixelSize: Theme.type.caption.size
                         }
                         MouseArea {
                             id: rowMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
@@ -288,23 +300,24 @@ Scope {
                     Item {
                         anchors.fill: parent
                         visible: list.count === 0
-                        Spinner { anchors.centerIn: parent; visible: root.busy; font.pixelSize: 16 }
+                        Spinner { anchors.centerIn: parent; visible: root.busy; size: Theme.iconMd }
                         Column {
-                            anchors.centerIn: parent; width: parent.width - 24; spacing: 4
+                            anchors.centerIn: parent; width: parent.width - 2 * Theme.spaceMd; spacing: Theme.spaceXs
                             visible: !root.busy
                             Text {
                                 width: parent.width; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.Wrap
                                 text: root.error ? root.error
                                     : (root.items.length === 0 ? "No logins in " + (root.providerLabel || "your password manager") + "."
                                                                : "Nothing matches “" + root.query + "”.")
-                                color: root.error ? Theme.danger : Theme.fg3; font.family: Theme.fontText; font.pixelSize: Theme.fsSmall
+                                color: root.error ? Theme.danger : Theme.textSecondary
+                                font.family: Theme.type.body.family; font.pixelSize: Theme.type.body.size
                                 maximumLineCount: 2; elide: Text.ElideRight
                             }
                             Text {
                                 width: parent.width; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.Wrap
                                 visible: root.hint !== ""
                                 text: root.hint
-                                color: Theme.fg3; font.family: Theme.fontText; font.pixelSize: 11
+                                color: Theme.textMuted; font.family: Theme.type.caption.family; font.pixelSize: Theme.type.caption.size
                                 maximumLineCount: 3; elide: Text.ElideRight
                             }
                         }
@@ -316,7 +329,7 @@ Scope {
                     width: parent.width
                     text: root.toast !== "" ? root.toast
                         : (root.matched > 0 ? root.matched + " for this app · " : "") + "Enter fill · Ctrl+Enter password · Ctrl+C user · Ctrl+Shift+C password · Ctrl+P pin"
-                    color: Theme.fg3; font.family: Theme.fontText; font.pixelSize: 10
+                    color: Theme.textMuted; font.family: Theme.type.caption.family; font.pixelSize: Theme.type.caption.size
                     elide: Text.ElideRight
                 }
             }
