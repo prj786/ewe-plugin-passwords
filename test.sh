@@ -109,5 +109,90 @@ rm -rf "$SB/run/ewe-pass"
 m="$(./ewe-pass match --class a --title b || true)"
 check "match: op error → ok:false with hint" "echo '$m' | grep -q '\"ok\": false' && echo '$m' | grep -q 'hint'"
 
+# 7. ewe Safe (provider ewe): a fake `ewe-safe` speaking docs/PROTOCOL.md --
+mkdir -p "$SB/safebin"
+cat > "$SB/safebin/ewe-safe" <<'ES'
+#!/usr/bin/env python3
+import json, os, sys
+a = sys.argv[1:]
+with open(os.environ["SAFE_LOG"], "a") as f:
+    f.write("ewe-safe " + " ".join(a) + "\n")
+st = open(os.environ["SAFE_STATE"]).read().strip()      # absent | locked | unlocked
+def out(o): print(json.dumps(o)); sys.exit(0)
+LOCKED = {"ok": False, "error": "locked", "message": "Safe is locked.", "hint": "ewe-safe unlock"}
+v = a[0] if a else ""
+if v == "status":
+    out({"ok": True, "set_up": st != "absent", "locked": st != "unlocked", "items": None if st != "unlocked" else 2})
+if v == "unlock":
+    open(os.environ["SAFE_STATE"], "w").write("unlocked"); out({"ok": True, "items": 2})
+if v == "lock":
+    open(os.environ["SAFE_STATE"], "w").write("locked"); out({"ok": True, "locked": True})
+if st != "unlocked":
+    out(LOCKED)
+ITEMS = [
+  {"id": "11111111-aaaa-4aaa-8aaa-111111111111", "kind": "login", "title": "Discord", "username": "sam",
+   "urls": ["https://www.discord.com/login"], "apps": [], "tags": [], "score": 30, "reason": "site matches the app"},
+  {"id": "22222222-bbbb-4bbb-8bbb-222222222222", "kind": "login", "title": "Router", "username": "admin",
+   "urls": [], "apps": [], "tags": [], "score": 0, "reason": ""},
+]
+SECRETS = {"11111111-aaaa-4aaa-8aaa-111111111111": {"username": "sam", "password": "Safe!Pässwörd-1"}}
+if v == "match":
+    out({"ok": True, "items": ITEMS})
+if v == "list":
+    out({"ok": True, "items": ITEMS})
+if v == "reveal":
+    sec = SECRETS.get(a[1], {})
+    if a[2] != "--field" or "--json" not in a or a[3] not in sec:
+        out({"ok": False, "error": "not-found", "message": "no item " + a[1]})
+    out({"ok": True, "value": sec[a[3]]})
+if v == "copy":
+    out({"ok": True, "cleared_after": 30})
+if v == "edit":
+    out({"ok": True, "sync": {"state": "in-sync"}})
+out({"ok": False, "error": "bad-request", "message": "unknown verb " + v})
+ES
+chmod +x "$SB/safebin/ewe-safe"
+export SAFE_LOG="$SB/safe.log" SAFE_STATE="$SB/safe.state"
+: > "$SAFE_LOG"; : > "$WTYPE_LOG"
+OLDPATH="$PATH"; export PATH="$SB/safebin:$PATH"
+j() { python3 -c "import json,sys; d=json.load(sys.stdin); $1" ; }
+
+echo absent > "$SAFE_STATE"
+st="$(./ewe-pass status)"
+check "Safe installed but not set up → auto keeps 1Password" "echo '$st' | j 'assert d[\"provider\"]==\"1password\", d'"
+echo unlocked > "$SAFE_STATE"
+st="$(./ewe-pass status)"
+check "a set-up, unlocked safe → auto picks ewe, ready" "echo '$st' | j 'assert d[\"provider\"]==\"ewe\" and d[\"ready\"] is True and d[\"label\"]==\"ewe Safe\", d'"
+m="$(./ewe-pass match --class discord --title 'Discord' --limit 5)"
+check "match: Safe's items and scores, host from the first url" "echo '$m' | j 'i=d[\"items\"][0]; assert d[\"provider\"]==\"ewe\" and i[\"id\"].startswith(\"1111\") and i[\"host\"]==\"discord.com\" and i[\"score\"]==30 and d[\"matched\"]==1, d'"
+check "match: the window and limit go to ewe-safe" "grep -q -- 'ewe-safe match --class discord --title Discord --limit 5' '$SAFE_LOG'"
+check "match: no item cache for Safe" "[ ! -e '$SB/run/ewe-pass/ewe.json' ]"
+r="$(FAKE_PID=4242 ./ewe-pass fill 11111111-aaaa-4aaa-8aaa-111111111111 --pid 4242)"
+check "fill from Safe types user, Tab, password" "[ \"\$(cat \"\$WTYPE_LOG\")\" = \$'wtype -d 8 - <sam>\nwtype -k Tab\nwtype -d 8 - <Safe!Pässwörd-1>' ]"
+check "fill asks reveal --json, never a secret on a command line" "grep -q 'reveal 11111111-aaaa-4aaa-8aaa-111111111111 --field password --json' '$SAFE_LOG' && ! grep -q 'Pässwörd' '$SAFE_LOG' && ! grep -qE 'wtype .*Pässwörd.*<' '$WTYPE_LOG'"
+rm -f "$SB/run/ewe-clip-skip"
+r="$(./ewe-pass copy 11111111-aaaa-4aaa-8aaa-111111111111 --what password)"
+check "copy is Safe's (it clears later), marker written" "echo '$r' | j 'assert d[\"ok\"] and d[\"cleared_after\"]==30, d' && grep -q 'ewe-safe copy 11111111-aaaa-4aaa-8aaa-111111111111 --field password' '$SAFE_LOG' && [ -f '$SB/run/ewe-clip-skip' ]"
+rm -f "$SB/cfg/ewe/passwords-apps.json"
+./ewe-pass remember 11111111-aaaa-4aaa-8aaa-111111111111 --class Discord >/dev/null
+./ewe-pass forget 11111111-aaaa-4aaa-8aaa-111111111111 --class Discord >/dev/null
+check "pins live in the safe: edit --app / --remove-app, lowercased" "grep -q 'edit 11111111-aaaa-4aaa-8aaa-111111111111 --app discord' '$SAFE_LOG' && grep -q 'edit 11111111-aaaa-4aaa-8aaa-111111111111 --remove-app discord' '$SAFE_LOG' && [ ! -e '$SB/cfg/ewe/passwords-apps.json' ]"
+r="$(./ewe-pass lock)"
+check "lock → ewe-safe lock" "echo '$r' | j 'assert d[\"ok\"] and d[\"locked\"], d' && [ \"\$(cat \"\$SAFE_STATE\")\" = locked ]"
+st="$(./ewe-pass status)"
+check "locked: status says so (not ready, locked)" "echo '$st' | j 'assert d[\"provider\"]==\"ewe\" and d[\"ready\"] is False and d[\"locked\"] is True, d'"
+m="$(./ewe-pass match --class discord --title x || true)"
+check "locked: match → error locked, the sentence in message, provider named" "echo '$m' | j 'assert d[\"ok\"] is False and d[\"error\"]==\"locked\" and d[\"message\"]==\"Safe is locked\" and d[\"provider\"]==\"ewe\" and d[\"hint\"], d'"
+: > "$WTYPE_LOG"
+r="$(FAKE_PID=4242 ./ewe-pass fill 11111111-aaaa-4aaa-8aaa-111111111111 --pid 4242 || true)"
+check "locked: fill types nothing, says locked" "echo '$r' | j 'assert d[\"error\"]==\"locked\", d' && [ ! -s \"\$WTYPE_LOG\" ]"
+r="$(./ewe-pass unlock)"
+check "unlock → ewe-safe unlock --ask" "echo '$r' | j 'assert d[\"ok\"] and d[\"items\"]==2, d' && grep -q 'ewe-safe unlock --ask' '$SAFE_LOG' && [ \"\$(cat \"\$SAFE_STATE\")\" = unlocked ]"
+r="$(EWE_PASS_PROVIDER=1password ./ewe-pass unlock || true)"
+check "unlock with another provider → a clear error" "echo '$r' | j 'assert d[\"ok\"] is False and \"ewe Safe\" in d[\"error\"], d'"
+export PATH="$OLDPATH"
+EWE_PASS_PROVIDER=ewe ./ewe-pass status > "$SB/st.json"     # (the message has an apostrophe)
+check "provider ewe without ewe-safe → install hint" "j 'assert d[\"ready\"] is False and \"ewe-safe\" in d[\"hint\"], d' < '$SB/st.json'"
+
 echo "ewe-pass: $pass passed, $failn failed"
 [ "$failn" = 0 ]
