@@ -18,6 +18,10 @@ import qs
 // move the secret from the manager's CLI straight to wtype / wl-copy.
 //   Enter  fill login (user ⇥ password)    Ctrl+Enter  password only
 //   Ctrl+C copy username    Ctrl+Shift+C copy password    Ctrl+P pin to app
+// With ewe Safe (provider ewe): a locked safe shows "press Enter to unlock";
+// Enter closes the picker (the login prompt or the Safe window needs the
+// keyboard — the master password is never typed here), runs `ewe-pass
+// unlock`, and reopens on the same window. Ctrl+L locks the safe.
 Scope {
     id: root
     property bool open: false
@@ -32,7 +36,10 @@ Scope {
 
     property var target: ({ pid: 0, cls: "", title: "" })   // the window we opened on
     property var items: []             // [{id, title, username, host, score, reason}]
+    property string provider: ""       // ewe | 1password | bitwarden | pass
     property string providerLabel: ""
+    property bool locked: false        // ewe Safe answered "locked"
+    property bool resumeTarget: false  // reopening after an unlock: keep the window
     property int matched: 0
     property bool busy: false
     property string error: ""
@@ -57,9 +64,12 @@ Scope {
 
     function openPicker() {
         // the window under the user's cursor NOW — before our layer takes focus
-        var t = Hyprland.activeToplevel, o = t ? t.lastIpcObject : null
-        target = { pid: o && o.pid ? o.pid : 0, cls: o && o.class ? o.class : "", title: o && o.title ? o.title : (t && t.title ? t.title : "") }
-        items = []; error = ""; hint = ""; toast = ""; query = ""; selected = 0; matched = 0
+        if (!resumeTarget) {
+            var t = Hyprland.activeToplevel, o = t ? t.lastIpcObject : null
+            target = { pid: o && o.pid ? o.pid : 0, cls: o && o.class ? o.class : "", title: o && o.title ? o.title : (t && t.title ? t.title : "") }
+        }
+        resumeTarget = false
+        items = []; error = ""; hint = ""; toast = ""; query = ""; selected = 0; matched = 0; locked = false
         input.text = ""
         busy = true
         matchProc.command = [root.tool, "match", "--class", target.cls, "--title", target.title, "--limit", "60"]
@@ -88,6 +98,18 @@ Scope {
         Quickshell.execDetached([root.tool, "remember", it.id, "--class", target.cls])
         toast = "Pinned " + it.title + " to " + target.cls
     }
+    function unlock() {
+        root.open = false        // the prompt (or the Safe window) takes the keyboard
+        unlockProc.running = true
+    }
+    function lock() {
+        if (root.provider !== "ewe") return
+        lockProc.running = true
+    }
+    function showLocked() {
+        items = []; matched = 0; selected = 0; locked = true
+        error = "Safe is locked — press Enter to unlock"; hint = ""
+    }
     function notify(title, body) { Quickshell.execDetached(["notify-send", "-a", "ewe", "-i", "dialog-password", title, body || ""]) }
 
     onOpenChanged: if (root.open) root.openPicker()
@@ -107,7 +129,12 @@ Scope {
                 var d = null
                 try { d = JSON.parse(this.text) } catch (e) { d = null }
                 if (!d) { root.error = "ewe-pass gave no answer"; root.hint = "Is bin/ewe-pass on PATH?"; return }
-                if (!d.ok) { root.error = d.error || "failed"; root.hint = d.hint || ""; return }
+                if (d.provider) root.provider = d.provider
+                if (d.label) root.providerLabel = d.label
+                if (!d.ok) {
+                    if (d.error === "locked") { root.showLocked(); return }
+                    root.error = d.message || d.error || "failed"; root.hint = d.hint || ""; return
+                }
                 root.providerLabel = d.label || d.provider || ""
                 root.items = d.items || []
                 root.matched = d.matched || 0
@@ -122,7 +149,7 @@ Scope {
             onStreamFinished: {
                 var d = null
                 try { d = JSON.parse(this.text) } catch (e) { d = null }
-                if (!d || !d.ok) root.notify("Couldn't fill", (d && d.error ? d.error : "no answer from ewe-pass") + (d && d.hint ? "\n" + d.hint : ""))
+                if (!d || !d.ok) root.notify("Couldn't fill", (d && (d.message || d.error) ? (d.message || d.error) : "no answer from ewe-pass") + (d && d.hint ? "\n" + d.hint : ""))
             }
         }
     }
@@ -133,8 +160,36 @@ Scope {
             onStreamFinished: {
                 var d = null
                 try { d = JSON.parse(this.text) } catch (e) { d = null }
-                if (!d || !d.ok) root.notify("Couldn't copy", (d && d.error ? d.error : "no answer from ewe-pass") + (d && d.hint ? "\n" + d.hint : ""))
+                if (!d || !d.ok) root.notify("Couldn't copy", (d && (d.message || d.error) ? (d.message || d.error) : "no answer from ewe-pass") + (d && d.hint ? "\n" + d.hint : ""))
                 else root.notify("Copied " + d.copied, "It won't be kept in the clipboard history.")
+            }
+        }
+    }
+
+    Process {
+        id: unlockProc
+        command: [root.tool, "unlock"]
+        environment: root.env
+        stdout: StdioCollector {
+            onStreamFinished: {
+                var d = null
+                try { d = JSON.parse(this.text) } catch (e) { d = null }
+                if (d && d.ok) { root.resumeTarget = true; root.open = true; return }
+                if (d && d.error === "cancelled") return
+                root.notify("Safe is still locked", (d ? (d.message || d.error || "") : "no answer from ewe-pass") + (d && d.hint ? "\n" + d.hint : ""))
+            }
+        }
+    }
+    Process {
+        id: lockProc
+        command: [root.tool, "lock"]
+        environment: root.env
+        stdout: StdioCollector {
+            onStreamFinished: {
+                var d = null
+                try { d = JSON.parse(this.text) } catch (e) { d = null }
+                if (d && d.ok) { root.showLocked(); root.toast = "Safe locked" }
+                else root.toast = "Couldn't lock Safe"
             }
         }
     }
@@ -241,9 +296,11 @@ Scope {
                             if (ev.key === Qt.Key_Escape) { root.open = false; ev.accepted = true }
                             else if (ev.key === Qt.Key_Down) { root.selected = Math.min(root.selected + 1, root.results.length - 1); ev.accepted = true }
                             else if (ev.key === Qt.Key_Up)   { root.selected = Math.max(root.selected - 1, 0); ev.accepted = true }
+                            else if ((ev.key === Qt.Key_Return || ev.key === Qt.Key_Enter) && root.locked) { root.unlock(); ev.accepted = true }
                             else if (ev.key === Qt.Key_Return || ev.key === Qt.Key_Enter) { root.fill(ctrl ? "password" : "login", false); ev.accepted = true }
                             else if (ctrl && ev.key === Qt.Key_C) { root.copy(shift ? "password" : "username"); ev.accepted = true }
                             else if (ctrl && ev.key === Qt.Key_P) { root.pin(); ev.accepted = true }
+                            else if (ctrl && ev.key === Qt.Key_L) { root.lock(); ev.accepted = true }
                         }
                     }
                 }
@@ -309,7 +366,7 @@ Scope {
                                 text: root.error ? root.error
                                     : (root.items.length === 0 ? "No logins in " + (root.providerLabel || "your password manager") + "."
                                                                : "Nothing matches “" + root.query + "”.")
-                                color: root.error ? Theme.danger : Theme.textSecondary
+                                color: root.error && !root.locked ? Theme.danger : Theme.textSecondary
                                 font.family: Theme.type.body.family; font.pixelSize: Theme.type.body.size
                                 maximumLineCount: 2; elide: Text.ElideRight
                             }
@@ -328,7 +385,9 @@ Scope {
                 Text {
                     width: parent.width
                     text: root.toast !== "" ? root.toast
+                        : root.locked ? "Enter unlock · Esc close"
                         : (root.matched > 0 ? root.matched + " for this app · " : "") + "Enter fill · Ctrl+Enter password · Ctrl+C user · Ctrl+Shift+C password · Ctrl+P pin"
+                          + (root.provider === "ewe" ? " · Ctrl+L lock" : "")
                     color: Theme.textMuted; font.family: Theme.type.caption.family; font.pixelSize: Theme.type.caption.size
                     elide: Text.ElideRight
                 }

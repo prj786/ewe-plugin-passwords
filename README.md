@@ -6,12 +6,19 @@
 types the one you pick — username, Tab, password — through a virtual
 keyboard, since no password manager fills into native apps on Linux.
 Ctrl+Enter types the password only, Ctrl+C / Ctrl+Shift+C copy, Ctrl+P pins
-a login to the app. Providers: 1Password (`op`, with the app's CLI
-integration turned on), Bitwarden (`rbw`), `pass`.
+a login to the app. Providers: **ewe Safe** (`ewe-safe`, ewe's own password
+manager — picked first once a safe is set up), 1Password (`op`, with the
+app's CLI integration turned on), Bitwarden (`rbw`), `pass`.
+
+With ewe Safe, Safe does the matching and a pin is an `app:<class>` tag on
+the login, so it follows you to every machine. A locked safe shows "press
+Enter to unlock": the picker steps aside for the login prompt (or the Safe
+window — the master password is never typed into the shell) and comes back
+on the same window. Ctrl+L locks the safe; copies are cleared by Safe.
 
     ewe-plugin remove ewe.passwords
     ewe-plugin add https://github.com/prj786/ewe-plugin-passwords.git --enable
 
-Settings: `provider` (auto / 1password / bitwarden / pass), `press_enter`.
+Settings: `provider` (auto / ewe / 1password / bitwarden / pass), `press_enter`.
 Needs `wtype` (an ewe dependency). `ewe-pass` in this folder is the tool the
 panel runs; `./ewe-pass status` says what it will do and why not.

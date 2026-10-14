@@ -24,8 +24,17 @@ printed and never passed as arguments — they go to wtype / wl-copy on stdin.
                                   wl-copy (cliphist skips it — see clip-store.sh)
   remember <id> [--class C]       pin an item to an app class; it sorts first
   forget <id> [--class C]
+  unlock                          ewe Safe only: `ewe-safe unlock --ask` (the
+                                  login prompt, or the Safe window)
+  lock                            ewe Safe only: `ewe-safe lock`
 
-Providers (ewe.conf [passwords] provider = auto | 1password | bitwarden | pass):
+Providers (ewe.conf [passwords] provider = auto | ewe | 1password | bitwarden | pass):
+  ewe        ewe Safe, `ewe-safe` (docs/PROTOCOL.md in prj786/ewe-safe): Safe
+             does the matching, pins are app:<class> tags inside the safe (so
+             they sync), secrets come from `reveal --json`, copy is the
+             daemon's (it clears the clipboard). Locked → {"error": "locked"};
+             the master password is never typed into the shell. `auto` picks
+             it first once a safe is set up
   1password  `op` with the desktop app's CLI integration (Settings →
              Developer → "Integrate with 1Password CLI"; unlock is the app's
              own prompt, the vault password never enters ewe)
@@ -54,16 +63,23 @@ CACHE_DIR = os.path.join(RUN_DIR, "ewe-pass")
 CACHE_TTL = 120          # s — the item LIST (titles, usernames, urls; no secrets)
 OP_TIMEOUT = 180         # s — the app's unlock prompt can wait for the user
 TYPE_DELAY_MS = 8
+SAFE_TIMEOUT = 20        # s — ewe-safe answers match/status from memory
+UNLOCK_TIMEOUT = 300     # s — `unlock --ask` waits for the user
 
 
 def out(obj):
     print(json.dumps(obj))
 
 
-def fail(error, hint="", code=1):
-    o = {"ok": False, "error": error}
+def fail(error, hint="", code=1, kind="", **extra):
+    # kind: a machine code the panel acts on ("locked") goes in "error" and
+    # the sentence moves to "message"; without one, "error" is the sentence
+    o = {"ok": False, "error": kind or error}
+    if kind:
+        o["message"] = error
     if hint:
         o["hint"] = hint
+    o.update(extra)
     out(o)
     sys.exit(code)
 
@@ -241,13 +257,103 @@ class PassStore:
         return {"username": user, "password": pw}
 
 
+class EweSafe:
+    """ewe Safe through its CLI (prj786/ewe-safe, docs/PROTOCOL.md). Safe
+    scores the matches itself; pins are app:<class> tags in the safe."""
+    name = "ewe"
+    label = "ewe Safe"
+    own_matching = True
+
+    def installed(self):
+        return have("ewe-safe")
+
+    def _run(self, args, timeout=SAFE_TIMEOUT):
+        r = subprocess.run(["ewe-safe", *args], capture_output=True, text=True, timeout=timeout)
+        try:
+            d = json.loads(r.stdout or "null")
+        except ValueError:
+            d = None
+        if not isinstance(d, dict):
+            raise ProviderError("ewe-safe gave no answer", "Reinstall Safe (package ewe-safe) with Komble")
+        if not d.get("ok"):
+            raise ProviderError(d.get("message") or d.get("error") or "ewe-safe failed",
+                                d.get("hint") or "", kind=d.get("error") or "")
+        return d
+
+    def set_up(self):
+        if not self.installed():
+            return False
+        try:
+            return bool(self._run(["status"], timeout=10).get("set_up"))
+        except (ProviderError, subprocess.TimeoutExpired):
+            return False
+
+    def check(self):
+        """None when ready, else the ProviderError to report (kind "locked"
+        when only an unlock is missing)."""
+        if not self.installed():
+            return ProviderError("Safe isn't installed", "Install Safe (package ewe-safe) with Komble")
+        try:
+            st = self._run(["status"], timeout=10)
+        except ProviderError as e:
+            return e
+        except subprocess.TimeoutExpired:
+            return ProviderError("Safe did not answer", "")
+        if not st.get("set_up"):
+            return ProviderError("No safe on this computer yet", "Open Safe to create one, or to open yours")
+        if st.get("locked"):
+            return ProviderError("Safe is locked", "Press Enter to unlock", kind="locked")
+        return None
+
+    def ready(self):
+        e = self.check()
+        return (True, "", "") if e is None else (False, e.error, e.hint)
+
+    def match(self, wclass, title, query, limit):
+        args = ["match", "--class", wclass or "", "--title", title or ""]
+        if query:
+            args += ["--query", query]
+        if limit > 0:
+            args += ["--limit", str(limit)]
+        res = []
+        for it in self._run(args).get("items") or []:
+            urls = it.get("urls") or []
+            res.append({"id": it.get("id", ""), "title": it.get("title", ""), "username": it.get("username", ""),
+                        "host": host_token(urls[0])[0] if urls else "",
+                        "score": int(it.get("score") or 0), "reason": it.get("reason") or ""})
+        return res
+
+    def items(self):
+        return [{"id": it.get("id", ""), "title": it.get("title", ""), "username": it.get("username", ""),
+                 "urls": it.get("urls") or [], "tags": it.get("tags") or []}
+                for it in self._run(["list", "--kind", "login"]).get("items") or []]
+
+    def reveal(self, item_id, field):
+        return self._run(["reveal", item_id, "--field", field, "--json"]).get("value") or ""
+
+    def secret(self, item_id):
+        return {"username": self.reveal(item_id, "username"), "password": self.reveal(item_id, "password")}
+
+    def copy(self, item_id, field):
+        return self._run(["copy", item_id, "--field", field])
+
+    def pin(self, item_id, wclass, add):
+        self._run(["edit", item_id, "--app" if add else "--remove-app", wclass])
+
+    def unlock(self):
+        return self._run(["unlock", "--ask"], timeout=UNLOCK_TIMEOUT)
+
+    def lock(self):
+        return self._run(["lock"])
+
+
 class ProviderError(Exception):
-    def __init__(self, error, hint=""):
+    def __init__(self, error, hint="", kind=""):
         super().__init__(error)
-        self.error, self.hint = error, hint
+        self.error, self.hint, self.kind = error, hint, kind
 
 
-PROVIDERS = [OnePassword(), Bitwarden(), PassStore()]
+PROVIDERS = [EweSafe(), OnePassword(), Bitwarden(), PassStore()]
 
 
 def pick_provider():
@@ -258,12 +364,31 @@ def pick_provider():
             if p.name == want:
                 return p
         fail("unknown provider %r in ewe.conf [passwords]" % want,
-             "provider = auto | 1password | bitwarden | pass")
-    for p in PROVIDERS:
+             "provider = auto | ewe | 1password | bitwarden | pass")
+    # ewe Safe first once a safe is set up; installed but empty, it is the
+    # last resort (its status then says how to set one up)
+    safe = PROVIDERS[0]
+    if safe.set_up():
+        return safe
+    for p in PROVIDERS[1:]:
         if p.installed():
             return p
+    if safe.installed():
+        return safe
     fail("no password manager CLI found",
-         "Install 1password-cli (and connect it in the 1Password app), rbw, or pass")
+         "Install Safe (ewe-safe), 1password-cli (and connect it in the 1Password app), rbw, or pass")
+
+
+def fail_provider(p, e):
+    """a ProviderError as the picker's JSON — kind "locked" is actionable"""
+    fail(e.error, e.hint, kind=e.kind, provider=p.name, label=p.label)
+
+
+def safe_only(verb):
+    p = pick_provider()
+    if p.name != "ewe":
+        fail("%s is for ewe Safe; the provider here is %s" % (verb, p.label))
+    return p
 
 
 # ── item list cache (no secrets: titles, usernames, hosts) ──────────────────
@@ -416,6 +541,8 @@ def cmd_status():
     o = {"ok": True, "provider": p.name, "label": p.label, "ready": ok}
     if not ok:
         o["error"], o["hint"] = err, hint
+        if p.name == "ewe":
+            o["locked"] = getattr(p.check(), "kind", "") == "locked"
     out(o)
 
 
@@ -432,6 +559,20 @@ def cmd_match(argv):
         w = active_window()
         wclass, title = w.get("class", ""), w.get("title", "")
     limit = int(arg(argv, "--limit", "0") or 0)
+    if getattr(p, "own_matching", False):
+        # Safe matches in memory (and pins live in it): no item cache here
+        e = p.check()
+        if e is not None:
+            fail_provider(p, e)
+        try:
+            res = p.match(wclass, title, arg(argv, "--query", ""), limit)
+        except ProviderError as e:
+            fail_provider(p, e)
+        except subprocess.TimeoutExpired:
+            fail("Safe did not answer", "")
+        out({"ok": True, "provider": p.name, "label": p.label, "class": wclass or "", "title": title or "",
+             "matched": sum(1 for r in res if r["score"] > 0), "items": res})
+        return
     try:
         items = cached_items(p, refresh="--refresh" in argv)
     except ProviderError as e:
@@ -461,7 +602,7 @@ def cmd_fill(argv):
     try:
         sec = p.secret(item_id)
     except ProviderError as e:
-        fail(e.error, e.hint)
+        fail_provider(p, e)
     except subprocess.TimeoutExpired:
         fail("the password manager did not answer", "Unlock it and try again")
     if what != "password" and not sec.get("username") and what == "login":
@@ -492,19 +633,29 @@ def cmd_copy(argv):
     what = arg(argv, "--what", "password")
     if what not in ("username", "password"):
         fail("--what must be username or password")
-    if not have("wl-copy"):
-        fail("wl-clipboard isn't installed")
     p = pick_provider()
-    try:
-        sec = p.secret(argv[1])
-    except ProviderError as e:
-        fail(e.error, e.hint)
     # tell the clipboard-history gate (clip-store.sh) to let this one pass by
+    # (Safe's own copy also carries the password-manager hint; the marker
+    # is consumed by that copy either way)
     try:
         with open(os.path.join(RUN_DIR, "ewe-clip-skip"), "w") as f:
             f.write(what)
     except OSError:
         pass
+    if p.name == "ewe":
+        # the daemon copies and clears the clipboard later if it still holds this
+        try:
+            d = p.copy(argv[1], what)
+        except ProviderError as e:
+            fail_provider(p, e)
+        out({"ok": True, "copied": what, "cleared_after": d.get("cleared_after")})
+        return
+    if not have("wl-copy"):
+        fail("wl-clipboard isn't installed")
+    try:
+        sec = p.secret(argv[1])
+    except ProviderError as e:
+        fail(e.error, e.hint)
     r = subprocess.run(["wl-copy", "--"], input=sec.get(what, ""), text=True, capture_output=True)
     if r.returncode != 0:
         fail("wl-copy failed: " + (r.stderr or "").strip())
@@ -518,6 +669,15 @@ def cmd_pin(argv, add):
     if not wclass:
         fail("no app class to pin to")
     wc = wclass.lower()
+    p = pick_provider()
+    if p.name == "ewe":
+        # an app:<class> tag on the item, inside the safe: the pin syncs
+        try:
+            p.pin(argv[1], wc, add)
+        except ProviderError as e:
+            fail_provider(p, e)
+        out({"ok": True, "class": wc, "pinned": [argv[1]] if add else []})
+        return
     pins = load_pins()
     lst = [i for i in (pins.get(wc) or []) if i != argv[1]]
     if add:
@@ -528,6 +688,26 @@ def cmd_pin(argv, add):
         pins.pop(wc, None)
     save_pins(pins)
     out({"ok": True, "class": wc, "pinned": lst})
+
+
+def cmd_unlock():
+    p = safe_only("unlock")
+    try:
+        d = p.unlock()
+    except ProviderError as e:
+        fail_provider(p, e)
+    except subprocess.TimeoutExpired:
+        fail("Safe is still locked", "The unlock prompt timed out")
+    out({"ok": True, "provider": p.name, "items": d.get("items")})
+
+
+def cmd_lock():
+    p = safe_only("lock")
+    try:
+        p.lock()
+    except ProviderError as e:
+        fail_provider(p, e)
+    out({"ok": True, "provider": p.name, "locked": True})
 
 
 def main(argv):
@@ -550,6 +730,10 @@ def main(argv):
             cmd_pin(argv, True)
         elif v == "forget":
             cmd_pin(argv, False)
+        elif v == "unlock":
+            cmd_unlock()
+        elif v == "lock":
+            cmd_lock()
         else:
             fail("unknown verb %r" % v, code=2)
     except SystemExit:

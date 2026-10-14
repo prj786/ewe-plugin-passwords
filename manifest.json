@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "id": "ewe.passwords",
   "name": "Passwords",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "apiVersion": 2,
-  "description": "Fill a login from your password manager (1Password, Bitwarden, pass) into any window — Super+P.",
+  "description": "Fill a login from your password manager (ewe Safe, 1Password, Bitwarden, pass) into any window — Super+P.",
   "icon": "icLock",
   "category": "Security",
   "homepage": "https://github.com/prj786/ewe-plugin-passwords",
@@ -29,6 +29,7 @@
       "label": "Password manager",
       "choices": [
         "auto",
+        "ewe",
         "1password",
         "bitwarden",
         "pass"
