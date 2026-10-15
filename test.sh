@@ -194,5 +194,49 @@ export PATH="$OLDPATH"
 EWE_PASS_PROVIDER=ewe ./ewe-pass status > "$SB/st.json"     # (the message has an apostrophe)
 check "provider ewe without ewe-safe → install hint" "j 'assert d[\"ready\"] is False and \"ewe-safe\" in d[\"hint\"], d' < '$SB/st.json'"
 
+# 8. Super+P without 1Password: "Use Safe" when the provider can't answer --
+# op as on the owner's machine 2026-10-15: the app integration is gone
+cat > "$SB/bin/op" <<'OP'
+#!/usr/bin/env bash
+echo "op $*" >> "$OP_LOG"
+echo "[ERROR] 2026/10/15 10:01:02 connecting to desktop app: connection reset, make sure 1Password CLI is installed correctly, then open the 1Password app" >&2
+exit 1
+OP
+cat > "$SB/bin/ewe-plugin" <<'EP'
+#!/usr/bin/env bash
+echo "ewe-plugin $*" >> "$PLUGIN_LOG"
+if [ -n "${PLUGIN_FAIL:-}" ]; then echo "ewe-plugin: $PLUGIN_FAIL" >&2; exit 1; fi
+echo '{"ok": true, "id": "ewe.passwords", "settings": {"provider": "ewe", "press_enter": false}}'
+EP
+chmod +x "$SB/bin/op" "$SB/bin/ewe-plugin"
+export PATH="$SB/safebin:$PATH" PLUGIN_LOG="$SB/plugin.log"
+: > "$PLUGIN_LOG"; : > "$SAFE_LOG"; rm -rf "$SB/run/ewe-pass"
+echo locked > "$SAFE_STATE"
+m="$(EWE_PASS_PROVIDER=1password ./ewe-pass match --class firefox --title GitHub || true)"
+check "1Password can't connect + a safe → match offers Safe" "echo '$m' | j 'assert d[\"ok\"] is False and d[\"use_safe\"] is True and \"connect\" in d[\"error\"], d'"
+EWE_PASS_PROVIDER=1password ./ewe-pass status > "$SB/st8.json"
+check "status offers Safe too" "j 'assert d[\"ready\"] is False and d[\"use_safe\"] is True, d' < '$SB/st8.json'"
+echo absent > "$SAFE_STATE"
+m="$(EWE_PASS_PROVIDER=1password ./ewe-pass match --class firefox --title GitHub || true)"
+check "no safe set up → nothing offered" "echo '$m' | j 'assert d[\"ok\"] is False and \"use_safe\" not in d, d'"
+echo unlocked > "$SAFE_STATE"
+printf '#!/usr/bin/env bash\necho "[ERROR] 2026/10/15 10:01:02 authorization prompt dismissed, please try again" >&2; exit 1\n' > "$SB/bin/op"
+m="$(EWE_PASS_PROVIDER=1password ./ewe-pass match --class firefox --title GitHub || true)"
+check "a prompt the user dismissed → no offer (that's a choice, not a failure)" "echo '$m' | j 'assert d[\"ok\"] is False and \"use_safe\" not in d, d'"
+# (op "not installed" is not tested here: this machine's real op would be
+# found on PATH, and the tests never run a real password manager)
+r="$(EWE_PASS_PROVIDER=1password ./ewe-pass use-safe)"
+check "use-safe → ewe-plugin set ewe.passwords provider ewe (the plugin-settings path)" "echo '$r' | j 'assert d[\"ok\"] and d[\"provider\"]==\"ewe\", d' && [ \"\$(cat '$PLUGIN_LOG')\" = 'ewe-plugin set ewe.passwords provider ewe' ]"
+check "use-safe never writes ewe.conf itself" "! grep -q 'ewe-conf set' '$SAFE_LOG' '$PLUGIN_LOG'"
+r="$(PLUGIN_FAIL='ewe.passwords: provider: not one of the choices' ./ewe-pass use-safe || true)"
+check "ewe-plugin refuses → its words, and where to change it by hand" "echo '$r' | j 'assert d[\"ok\"] is False and \"choices\" in d[\"error\"] and \"Komble\" in d[\"hint\"], d'"
+: > "$PLUGIN_LOG"; echo absent > "$SAFE_STATE"
+r="$(./ewe-pass use-safe || true)"
+check "use-safe without a safe → says so, changes nothing" "echo '$r' | j 'assert d[\"ok\"] is False and \"No safe\" in d[\"error\"], d' && [ ! -s '$PLUGIN_LOG' ]"
+echo locked > "$SAFE_STATE"
+st="$(./ewe-pass status)"
+check "auto (the default) prefers Safe once one is set up, locked or not" "echo '$st' | j 'assert d[\"provider\"]==\"ewe\" and \"use_safe\" not in d, d'"
+export PATH="$OLDPATH"
+
 echo "ewe-pass: $pass passed, $failn failed"
 [ "$failn" = 0 ]

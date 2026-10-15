@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "ewe.passwords",
   "name": "Passwords",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "apiVersion": 2,
   "description": "Fill a login from your password manager (ewe Safe, 1Password, Bitwarden, pass) into any window — Super+P.",
   "icon": "icLock",
