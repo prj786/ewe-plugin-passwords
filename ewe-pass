@@ -73,18 +73,24 @@ TYPE_DELAY_MS = 8
 SAFE_TIMEOUT = 20        # s — ewe-safe answers match/status from memory
 UNLOCK_TIMEOUT = 300     # s — `unlock --ask` waits for the user
 PLUGIN_ID = "ewe.passwords"
-# a provider that says one of these can't answer at all (as opposed to a
-# locked vault or a prompt the user turned down): Safe is offered instead
-CANT_ANSWER = ("isn't installed", "not installed", "connect", "reset", "refused", "no account",
-               "not signed in", "did not answer", "timed out", "timeout", "not found",
-               "no such file", "not running", "isn't running")
+OP_INSTALL = "Install it with Komble (package 1password-cli)"
+RBW_INSTALL = "Install rbw (Bitwarden CLI agent) with Komble and run `rbw login`"
+SAFE_INSTALL = "Install Safe (package ewe-safe) with Komble"
+# a provider that says one of these can't answer at all — not installed,
+# not connected to its app, not signed in — as opposed to a locked vault, a
+# prompt the user turned down, or a slow answer: Safe is offered instead.
+# "connecting to desktop app" is 1Password's own text when the CLI can't
+# reach the app ("…: connection reset, make sure 1Password CLI is installed")
+CANT_ANSWER = ("isn't installed", "not installed", "not connected", "no account", "not signed in",
+               "isn't running", "not running", "connecting to desktop app",
+               "make sure 1password cli is installed", "store not found")
 
 
 def out(obj):
     print(json.dumps(obj))
 
 
-def fail(error, hint="", code=1, kind="", **extra):
+def fail(error, hint="", code=0, kind="", **extra):
     # kind: a machine code the panel acts on ("locked") goes in "error" and
     # the sentence moves to "message"; without one, "error" is the sentence
     o = {"ok": False, "error": kind or error}
@@ -95,6 +101,15 @@ def fail(error, hint="", code=1, kind="", **extra):
     o.update(extra)
     out(o)
     sys.exit(code)
+
+
+def run_tool(argv, missing, hint, **kw):
+    """subprocess.run, but a program that isn't there is a ProviderError
+    (with how to install it), not a traceback"""
+    try:
+        return subprocess.run(argv, **kw)
+    except FileNotFoundError:
+        raise ProviderError(missing, hint)
 
 
 def have(cmd):
@@ -126,7 +141,8 @@ class OnePassword:
         return have("op")
 
     def _run(self, args, timeout=OP_TIMEOUT):
-        r = subprocess.run(["op", *args, "--format", "json"], capture_output=True, text=True, timeout=timeout)
+        r = run_tool(["op", *args, "--format", "json"], "1password-cli isn't installed", OP_INSTALL,
+                     capture_output=True, text=True, timeout=timeout)
         if r.returncode != 0:
             # op's stderr is prose (several lines of advice); the first
             # non-empty line is the actual error, minus its "[ERROR] <time>" stamp
@@ -145,9 +161,10 @@ class OnePassword:
 
     def ready(self):
         if not have("op"):
-            return False, "1password-cli isn't installed", "Install it with Komble (package 1password-cli)"
+            return False, "1password-cli isn't installed", OP_INSTALL
         try:
-            accts = self._run(["account", "list"], timeout=20)
+            # the app may ask to approve the CLI first: as long as any op call
+            accts = self._run(["account", "list"])
         except ProviderError as e:
             return False, e.error, e.hint
         except subprocess.TimeoutExpired:
@@ -192,14 +209,15 @@ class Bitwarden:
 
     def ready(self):
         if not have("rbw"):
-            return False, "rbw isn't installed", "Install rbw (Bitwarden CLI agent) with Komble and run `rbw login`"
+            return False, "rbw isn't installed", RBW_INSTALL
         r = subprocess.run(["rbw", "unlocked"], capture_output=True, text=True, timeout=10)
         if r.returncode != 0:
             return False, "Bitwarden vault is locked", "Run `rbw unlock` in a terminal"
         return True, "", ""
 
     def items(self):
-        r = subprocess.run(["rbw", "list", "--fields", "id,name,user,folder"], capture_output=True, text=True, timeout=60)
+        r = run_tool(["rbw", "list", "--fields", "id,name,user,folder"], "rbw isn't installed", RBW_INSTALL,
+                     capture_output=True, text=True, timeout=60)
         if r.returncode != 0:
             raise ProviderError((r.stderr or "rbw list failed").strip(), "Run `rbw unlock` in a terminal")
         items = []
@@ -220,7 +238,7 @@ class Bitwarden:
         if name is None:
             raise ProviderError("item not found", "")
         args = ["rbw", "get", "--raw", name] + ([user] if user else [])
-        r = subprocess.run(args, capture_output=True, text=True, timeout=60)
+        r = run_tool(args, "rbw isn't installed", RBW_INSTALL, capture_output=True, text=True, timeout=60)
         if r.returncode != 0:
             raise ProviderError((r.stderr or "rbw get failed").strip(), "")
         d = json.loads(r.stdout or "{}")
@@ -256,7 +274,8 @@ class PassStore:
         return items
 
     def secret(self, item_id):
-        r = subprocess.run(["pass", "show", item_id], capture_output=True, text=True, timeout=120)
+        r = run_tool(["pass", "show", item_id], "pass isn't installed", "Install pass and run `pass init`",
+                     capture_output=True, text=True, timeout=120)
         if r.returncode != 0:
             raise ProviderError((r.stderr or "pass show failed").strip(), "")
         lines = r.stdout.splitlines()
@@ -281,7 +300,8 @@ class EweSafe:
         return have("ewe-safe")
 
     def _run(self, args, timeout=SAFE_TIMEOUT):
-        r = subprocess.run(["ewe-safe", *args], capture_output=True, text=True, timeout=timeout)
+        r = run_tool(["ewe-safe", *args], "Safe isn't installed", SAFE_INSTALL,
+                     capture_output=True, text=True, timeout=timeout)
         try:
             d = json.loads(r.stdout or "null")
         except ValueError:
@@ -305,7 +325,7 @@ class EweSafe:
         """None when ready, else the ProviderError to report (kind "locked"
         when only an unlock is missing)."""
         if not self.installed():
-            return ProviderError("Safe isn't installed", "Install Safe (package ewe-safe) with Komble")
+            return ProviderError("Safe isn't installed", SAFE_INSTALL)
         try:
             st = self._run(["status"], timeout=10)
         except ProviderError as e:
@@ -613,8 +633,8 @@ def cmd_match(argv):
         why = err if not ok and err else e.error
         fail(why, hint if not ok and hint else e.hint, **offer_safe(p, why))
     except subprocess.TimeoutExpired:
-        fail("the password manager did not answer", "Unlock it and try again",
-             **offer_safe(p, "did not answer"))
+        # slow is not missing (an approval prompt can take a while): no offer
+        fail("the password manager did not answer", "Unlock it and try again")
     res = score_items(items, wclass, title, arg(argv, "--query", ""), load_pins())
     if limit > 0:
         res = res[:limit]
@@ -751,7 +771,7 @@ def cmd_use_safe():
     written through ewe-conf, live). Never `ewe-conf set` on the dotted id."""
     safe = PROVIDERS[0]
     if not safe.installed():
-        fail("Safe isn't installed", "Install Safe (package ewe-safe) with Komble")
+        fail("Safe isn't installed", SAFE_INSTALL)
     if not safe.set_up():
         fail("No safe on this computer yet", "Open Safe to create one, or to open yours")
     tool = plugin_tool()
@@ -804,12 +824,11 @@ def main(argv):
         elif v == "use-safe":
             cmd_use_safe()
         else:
-            fail("unknown verb %r" % v, code=2)
+            fail("unknown verb %r" % v)
     except SystemExit:
         raise
     except Exception as e:  # one JSON line, never a traceback, for the shell
         out({"ok": False, "error": str(e)})
-        return 1
     return 0
 
 

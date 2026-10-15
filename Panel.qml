@@ -32,12 +32,21 @@ Scope {
     // {provider: auto|ewe|1password|bitwarden|pass, press_enter: bool} —
     // handed to ewe-pass as environment, which beats ewe.conf [passwords]
     property var settings: ({})
-    // "Use Safe" was chosen: ewe until the host hands the new setting back
+    readonly property string providerSetting: root.settings.provider || "auto"
+    // "Use Safe" was chosen: ewe for as long as the setting still reads what
+    // it read then. Any new value from the host — ewe from that click, or
+    // another the user picks later — wins; no change signal needed (the
+    // host reassigns `settings` on each reload today, but a binding doesn't
+    // depend on it)
     property string providerOverride: ""
-    onSettingsChanged: if (root.providerOverride !== "" && root.settings.provider === root.providerOverride) root.providerOverride = ""
+    property string overrideOver: ""
+    readonly property string providerNow: root.providerOverride !== "" && root.providerSetting === root.overrideOver
+                                          ? root.providerOverride : root.providerSetting
+    // once the setting moved, the override is spent for good
+    onProviderSettingChanged: if (root.providerSetting !== root.overrideOver) root.providerOverride = ""
     readonly property string tool: Qt.resolvedUrl("ewe-pass").toString().replace(/^file:\/\//, "")
     readonly property var env: [
-        "EWE_PASS_PROVIDER=" + (root.providerOverride || root.settings.provider || "auto"),
+        "EWE_PASS_PROVIDER=" + root.providerNow,
         "EWE_PASS_ENTER=" + (root.settings.press_enter ? "1" : "0")
     ]
 
@@ -209,6 +218,7 @@ Scope {
                     root.toast = "Couldn't switch to Safe" + (d && (d.message || d.error) ? ": " + (d.message || d.error) : "")
                     return
                 }
+                root.overrideOver = root.providerSetting
                 root.providerOverride = "ewe"
                 root.resumeTarget = true          // the same window, now from Safe
                 root.openPicker()
