@@ -10,7 +10,10 @@ cd "$(dirname "$0")"
 SB="$(mktemp -d)"
 trap 'rm -rf "$SB"' EXIT
 export XDG_CONFIG_HOME="$SB/cfg" XDG_RUNTIME_DIR="$SB/run" HOME="$SB/home"
-mkdir -p "$SB/cfg/ewe" "$SB/run" "$SB/home" "$SB/bin"
+mkdir -p "$SB/cfg/ewe" "$SB/run" "$SB/home" "$SB/bin" "$SB/sys"
+# a PATH with the fakes and a few system tools only: this machine's real op,
+# ewe-safe, rbw or pass can never answer a test
+for t in bash python3 cat grep stat chmod rm mkdir; do ln -s "$(command -v "$t")" "$SB/sys/$t"; done
 
 # fake 1Password CLI ------------------------------------------------------
 cat > "$SB/bin/op" <<'OP'
@@ -46,7 +49,7 @@ HC
 # fake ewe-conf: unset keys ---------------------------------------------------
 printf '#!/usr/bin/env bash\necho "{\\"error\\": \\"no-key\\"}"\n' > "$SB/bin/ewe-conf"
 chmod +x "$SB/bin/"*
-export PATH="$SB/bin:$PATH" OP_LOG="$SB/op.log" WTYPE_LOG="$SB/wtype.log"
+export PATH="$SB/bin:$SB/sys" OP_LOG="$SB/op.log" WTYPE_LOG="$SB/wtype.log"
 : > "$OP_LOG"; : > "$WTYPE_LOG"
 
 pass=0; failn=0
@@ -191,8 +194,66 @@ check "unlock → ewe-safe unlock --ask" "echo '$r' | j 'assert d[\"ok\"] and d[
 r="$(EWE_PASS_PROVIDER=1password ./ewe-pass unlock || true)"
 check "unlock with another provider → a clear error" "echo '$r' | j 'assert d[\"ok\"] is False and \"ewe Safe\" in d[\"error\"], d'"
 export PATH="$OLDPATH"
+check "no ewe-safe on the test PATH (the real one never answers)" "! command -v ewe-safe >/dev/null"
 EWE_PASS_PROVIDER=ewe ./ewe-pass status > "$SB/st.json"     # (the message has an apostrophe)
-check "provider ewe without ewe-safe → install hint" "j 'assert d[\"ready\"] is False and \"ewe-safe\" in d[\"hint\"], d' < '$SB/st.json'"
+check "provider ewe without ewe-safe → install hint" "j 'assert d[\"ready\"] is False and d[\"error\"]==\"Safe isn\x27t installed\" and d[\"hint\"]==\"Install Safe (package ewe-safe) with Komble\", d' < '$SB/st.json'"
+EWE_PASS_PROVIDER=ewe ./ewe-pass match --class x --title y > "$SB/m.json"
+check "match with provider ewe and no ewe-safe → the same, no traceback" "j 'assert d[\"ok\"] is False and d[\"hint\"]==\"Install Safe (package ewe-safe) with Komble\", d' < '$SB/m.json'"
+
+# 8. Super+P without 1Password: "Use Safe" when the provider can't answer --
+# op as on the owner's machine 2026-10-15: the app integration is gone
+cat > "$SB/bin/op" <<'OP'
+#!/usr/bin/env bash
+echo "op $*" >> "$OP_LOG"
+echo "[ERROR] 2026/10/15 10:01:02 connecting to desktop app: connection reset, make sure 1Password CLI is installed correctly, then open the 1Password app" >&2
+exit 1
+OP
+cat > "$SB/bin/ewe-plugin" <<'EP'
+#!/usr/bin/env bash
+echo "ewe-plugin $*" >> "$PLUGIN_LOG"
+if [ -n "${PLUGIN_FAIL:-}" ]; then echo "ewe-plugin: $PLUGIN_FAIL" >&2; exit 1; fi
+echo '{"ok": true, "id": "ewe.passwords", "settings": {"provider": "ewe", "press_enter": false}}'
+EP
+chmod +x "$SB/bin/op" "$SB/bin/ewe-plugin"
+export PATH="$SB/safebin:$PATH" PLUGIN_LOG="$SB/plugin.log"
+: > "$PLUGIN_LOG"; : > "$SAFE_LOG"; rm -rf "$SB/run/ewe-pass"
+echo locked > "$SAFE_STATE"
+m="$(EWE_PASS_PROVIDER=1password ./ewe-pass match --class firefox --title GitHub || true)"
+check "1Password can't connect + a safe → match offers Safe" "echo '$m' | j 'assert d[\"ok\"] is False and d[\"use_safe\"] is True and \"connect\" in d[\"error\"], d'"
+EWE_PASS_PROVIDER=1password ./ewe-pass status > "$SB/st8.json"
+check "status offers Safe too" "j 'assert d[\"ready\"] is False and d[\"use_safe\"] is True, d' < '$SB/st8.json'"
+echo absent > "$SAFE_STATE"
+m="$(EWE_PASS_PROVIDER=1password ./ewe-pass match --class firefox --title GitHub || true)"
+check "no safe set up → nothing offered" "echo '$m' | j 'assert d[\"ok\"] is False and \"use_safe\" not in d, d'"
+echo unlocked > "$SAFE_STATE"
+printf '#!/usr/bin/env bash\necho "[ERROR] 2026/10/15 10:01:02 authorization prompt dismissed, please try again" >&2; exit 1\n' > "$SB/bin/op"
+m="$(EWE_PASS_PROVIDER=1password ./ewe-pass match --class firefox --title GitHub || true)"
+check "a prompt the user dismissed → no offer (that's a choice, not a failure)" "echo '$m' | j 'assert d[\"ok\"] is False and \"use_safe\" not in d, d'"
+# op not installed at all (no op anywhere on this PATH): the missing binary
+# is "1password-cli isn't installed", with the hint, and Safe is offered
+check "no op on the test PATH" "! PATH='$SB/safebin:$SB/sys' command -v op >/dev/null"
+rm -rf "$SB/run/ewe-pass"
+PATH="$SB/safebin:$SB/sys" EWE_PASS_PROVIDER=1password ./ewe-pass match --class firefox --title GitHub > "$SB/m8.json"
+check "op missing → install hint and Safe offered (no Errno)" "j 'assert d[\"ok\"] is False and d[\"use_safe\"] is True and d[\"error\"]==\"1password-cli isn\x27t installed\" and d[\"hint\"]==\"Install it with Komble (package 1password-cli)\", d' < '$SB/m8.json'"
+PATH="$SB/safebin:$SB/sys" EWE_PASS_PROVIDER=bitwarden ./ewe-pass match --class firefox --title GitHub > "$SB/m9.json"
+check "rbw missing → install hint and Safe offered" "j 'assert d[\"use_safe\"] is True and d[\"error\"]==\"rbw isn\x27t installed\", d' < '$SB/m9.json'"
+# slow is not missing: a timeout offers nothing
+printf '#!/usr/bin/env bash\necho "[ERROR] 2026/10/15 10:01:02 timed out waiting for the 1Password app" >&2; exit 1\n' > "$SB/bin/op"
+rm -rf "$SB/run/ewe-pass"
+m="$(EWE_PASS_PROVIDER=1password ./ewe-pass match --class firefox --title GitHub)"
+check "a slow or timed-out manager → no offer" "echo '$m' | j 'assert d[\"ok\"] is False and \"use_safe\" not in d, d'"
+r="$(EWE_PASS_PROVIDER=1password ./ewe-pass use-safe)"
+check "use-safe → ewe-plugin set ewe.passwords provider ewe (the plugin-settings path)" "echo '$r' | j 'assert d[\"ok\"] and d[\"provider\"]==\"ewe\", d' && [ \"\$(cat '$PLUGIN_LOG')\" = 'ewe-plugin set ewe.passwords provider ewe' ]"
+check "use-safe never writes ewe.conf itself" "! grep -q 'ewe-conf set' '$SAFE_LOG' '$PLUGIN_LOG'"
+r="$(PLUGIN_FAIL='ewe.passwords: provider: not one of the choices' ./ewe-pass use-safe || true)"
+check "ewe-plugin refuses → its words, and where to change it by hand" "echo '$r' | j 'assert d[\"ok\"] is False and \"choices\" in d[\"error\"] and \"Komble\" in d[\"hint\"], d'"
+: > "$PLUGIN_LOG"; echo absent > "$SAFE_STATE"
+r="$(./ewe-pass use-safe || true)"
+check "use-safe without a safe → says so, changes nothing" "echo '$r' | j 'assert d[\"ok\"] is False and \"No safe\" in d[\"error\"], d' && [ ! -s '$PLUGIN_LOG' ]"
+echo locked > "$SAFE_STATE"
+st="$(./ewe-pass status)"
+check "auto (the default) prefers Safe once one is set up, locked or not" "echo '$st' | j 'assert d[\"provider\"]==\"ewe\" and \"use_safe\" not in d, d'"
+export PATH="$OLDPATH"
 
 echo "ewe-pass: $pass passed, $failn failed"
 [ "$failn" = 0 ]

@@ -22,15 +22,31 @@ import qs
 // Enter closes the picker (the login prompt or the Safe window needs the
 // keyboard — the master password is never typed here), runs `ewe-pass
 // unlock`, and reopens on the same window. Ctrl+L locks the safe.
+// When the provider can't answer at all (1Password's CLI missing or not
+// reaching its app) and a safe is set up, the error row offers "Use Safe"
+// (Enter): `ewe-pass use-safe` sets this plugin's own `provider` setting
+// through `ewe-plugin set`, and the list reloads from Safe.
 Scope {
     id: root
     property bool open: false
-    // {provider: auto|1password|bitwarden|pass, press_enter: bool} — handed
-    // to ewe-pass as environment, which beats ewe.conf [passwords]
+    // {provider: auto|ewe|1password|bitwarden|pass, press_enter: bool} —
+    // handed to ewe-pass as environment, which beats ewe.conf [passwords]
     property var settings: ({})
+    readonly property string providerSetting: root.settings.provider || "auto"
+    // "Use Safe" was chosen: ewe for as long as the setting still reads what
+    // it read then. Any new value from the host — ewe from that click, or
+    // another the user picks later — wins; no change signal needed (the
+    // host reassigns `settings` on each reload today, but a binding doesn't
+    // depend on it)
+    property string providerOverride: ""
+    property string overrideOver: ""
+    readonly property string providerNow: root.providerOverride !== "" && root.providerSetting === root.overrideOver
+                                          ? root.providerOverride : root.providerSetting
+    // once the setting moved, the override is spent for good
+    onProviderSettingChanged: if (root.providerSetting !== root.overrideOver) root.providerOverride = ""
     readonly property string tool: Qt.resolvedUrl("ewe-pass").toString().replace(/^file:\/\//, "")
     readonly property var env: [
-        "EWE_PASS_PROVIDER=" + (root.settings.provider || "auto"),
+        "EWE_PASS_PROVIDER=" + root.providerNow,
         "EWE_PASS_ENTER=" + (root.settings.press_enter ? "1" : "0")
     ]
 
@@ -39,6 +55,8 @@ Scope {
     property string provider: ""       // ewe | 1password | bitwarden | pass
     property string providerLabel: ""
     property bool locked: false        // ewe Safe answered "locked"
+    property bool offerSafe: false     // the provider can't answer; a safe is set up
+    property bool switching: false     // `ewe-pass use-safe` is running
     property bool resumeTarget: false  // reopening after an unlock: keep the window
     property int matched: 0
     property bool busy: false
@@ -69,7 +87,7 @@ Scope {
             target = { pid: o && o.pid ? o.pid : 0, cls: o && o.class ? o.class : "", title: o && o.title ? o.title : (t && t.title ? t.title : "") }
         }
         resumeTarget = false
-        items = []; error = ""; hint = ""; toast = ""; query = ""; selected = 0; matched = 0; locked = false
+        items = []; error = ""; hint = ""; toast = ""; query = ""; selected = 0; matched = 0; locked = false; offerSafe = false
         input.text = ""
         busy = true
         matchProc.command = [root.tool, "match", "--class", target.cls, "--title", target.title, "--limit", "60"]
@@ -102,6 +120,11 @@ Scope {
         root.open = false        // the prompt (or the Safe window) takes the keyboard
         unlockProc.running = true
     }
+    function useSafe() {
+        if (!root.offerSafe || root.switching) return
+        root.switching = true
+        useSafeProc.running = true
+    }
     function lock() {
         if (root.provider !== "ewe") return
         lockProc.running = true
@@ -133,7 +156,9 @@ Scope {
                 if (d.label) root.providerLabel = d.label
                 if (!d.ok) {
                     if (d.error === "locked") { root.showLocked(); return }
-                    root.error = d.message || d.error || "failed"; root.hint = d.hint || ""; return
+                    root.error = d.message || d.error || "failed"; root.hint = d.hint || ""
+                    root.offerSafe = d.use_safe === true
+                    return
                 }
                 root.providerLabel = d.label || d.provider || ""
                 root.items = d.items || []
@@ -177,6 +202,27 @@ Scope {
                 if (d && d.ok) { root.resumeTarget = true; root.open = true; return }
                 if (d && d.error === "cancelled") return
                 root.notify("Safe is still locked", (d ? (d.message || d.error || "") : "no answer from ewe-pass") + (d && d.hint ? "\n" + d.hint : ""))
+            }
+        }
+    }
+    Process {
+        id: useSafeProc
+        command: [root.tool, "use-safe"]
+        environment: root.env
+        stdout: StdioCollector {
+            onStreamFinished: {
+                root.switching = false
+                var d = null
+                try { d = JSON.parse(this.text) } catch (e) { d = null }
+                if (!d || !d.ok) {
+                    root.toast = "Couldn't switch to Safe" + (d && (d.message || d.error) ? ": " + (d.message || d.error) : "")
+                    return
+                }
+                root.overrideOver = root.providerSetting
+                root.providerOverride = "ewe"
+                root.resumeTarget = true          // the same window, now from Safe
+                root.openPicker()
+                root.toast = "Super+P fills from Safe now"
             }
         }
     }
@@ -297,6 +343,7 @@ Scope {
                             else if (ev.key === Qt.Key_Down) { root.selected = Math.min(root.selected + 1, root.results.length - 1); ev.accepted = true }
                             else if (ev.key === Qt.Key_Up)   { root.selected = Math.max(root.selected - 1, 0); ev.accepted = true }
                             else if ((ev.key === Qt.Key_Return || ev.key === Qt.Key_Enter) && root.locked) { root.unlock(); ev.accepted = true }
+                            else if ((ev.key === Qt.Key_Return || ev.key === Qt.Key_Enter) && root.offerSafe && root.results.length === 0) { root.useSafe(); ev.accepted = true }
                             else if (ev.key === Qt.Key_Return || ev.key === Qt.Key_Enter) { root.fill(ctrl ? "password" : "login", false); ev.accepted = true }
                             else if (ctrl && ev.key === Qt.Key_C) { root.copy(shift ? "password" : "username"); ev.accepted = true }
                             else if (ctrl && ev.key === Qt.Key_P) { root.pin(); ev.accepted = true }
@@ -372,10 +419,18 @@ Scope {
                             }
                             Text {
                                 width: parent.width; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.Wrap
-                                visible: root.hint !== ""
+                                visible: root.hint !== "" && !root.offerSafe
                                 text: root.hint
                                 color: Theme.textMuted; font.family: Theme.type.caption.family; font.pixelSize: Theme.type.caption.size
                                 maximumLineCount: 3; elide: Text.ElideRight
+                            }
+                            // the provider can't answer, Safe can: one click (or Enter)
+                            QsButton {
+                                anchors.horizontalCenter: parent.horizontalCenter
+                                visible: root.offerSafe
+                                label: "Use Safe"; ic: Theme.icLock; variant: "primary"; size: "sm"
+                                busy: root.switching; disabled: root.switching
+                                onGo: root.useSafe()
                             }
                         }
                     }
@@ -386,6 +441,7 @@ Scope {
                     width: parent.width
                     text: root.toast !== "" ? root.toast
                         : root.locked ? "Enter unlock · Esc close"
+                        : root.offerSafe ? "Enter use Safe for Super+P · Esc close"
                         : (root.matched > 0 ? root.matched + " for this app · " : "") + "Enter fill · Ctrl+Enter password · Ctrl+C user · Ctrl+Shift+C password · Ctrl+P pin"
                           + (root.provider === "ewe" ? " · Ctrl+L lock" : "")
                     color: Theme.textMuted; font.family: Theme.type.caption.family; font.pixelSize: Theme.type.caption.size

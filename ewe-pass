@@ -27,6 +27,9 @@ printed and never passed as arguments — they go to wtype / wl-copy on stdin.
   unlock                          ewe Safe only: `ewe-safe unlock --ask` (the
                                   login prompt, or the Safe window)
   lock                            ewe Safe only: `ewe-safe lock`
+  use-safe                        make ewe Safe the provider: `ewe-plugin set
+                                  ewe.passwords provider ewe` (the plugin's
+                                  own setting, live). Needs a safe set up
 
 Providers (ewe.conf [passwords] provider = auto | ewe | 1password | bitwarden | pass):
   ewe        ewe Safe, `ewe-safe` (docs/PROTOCOL.md in prj786/ewe-safe): Safe
@@ -46,6 +49,10 @@ Matching: an item's URL host (discord.com → "discord") against the window
 class and title, the tag `app:<class>` on the item, a remembered pin, and the
 search text. Nothing matched → every item, alphabetically, so the search box
 still finds it.
+
+When another provider can't answer at all (not installed, can't reach its
+app) and a safe is set up, `match` and `status` add "use_safe": true: the
+picker then offers "Use Safe", which runs `use-safe`.
 """
 
 import json
@@ -65,13 +72,25 @@ OP_TIMEOUT = 180         # s — the app's unlock prompt can wait for the user
 TYPE_DELAY_MS = 8
 SAFE_TIMEOUT = 20        # s — ewe-safe answers match/status from memory
 UNLOCK_TIMEOUT = 300     # s — `unlock --ask` waits for the user
+PLUGIN_ID = "ewe.passwords"
+OP_INSTALL = "Install it with Komble (package 1password-cli)"
+RBW_INSTALL = "Install rbw (Bitwarden CLI agent) with Komble and run `rbw login`"
+SAFE_INSTALL = "Install Safe (package ewe-safe) with Komble"
+# a provider that says one of these can't answer at all — not installed,
+# not connected to its app, not signed in — as opposed to a locked vault, a
+# prompt the user turned down, or a slow answer: Safe is offered instead.
+# "connecting to desktop app" is 1Password's own text when the CLI can't
+# reach the app ("…: connection reset, make sure 1Password CLI is installed")
+CANT_ANSWER = ("isn't installed", "not installed", "not connected", "no account", "not signed in",
+               "isn't running", "not running", "connecting to desktop app",
+               "make sure 1password cli is installed", "store not found")
 
 
 def out(obj):
     print(json.dumps(obj))
 
 
-def fail(error, hint="", code=1, kind="", **extra):
+def fail(error, hint="", code=0, kind="", **extra):
     # kind: a machine code the panel acts on ("locked") goes in "error" and
     # the sentence moves to "message"; without one, "error" is the sentence
     o = {"ok": False, "error": kind or error}
@@ -82,6 +101,15 @@ def fail(error, hint="", code=1, kind="", **extra):
     o.update(extra)
     out(o)
     sys.exit(code)
+
+
+def run_tool(argv, missing, hint, **kw):
+    """subprocess.run, but a program that isn't there is a ProviderError
+    (with how to install it), not a traceback"""
+    try:
+        return subprocess.run(argv, **kw)
+    except FileNotFoundError:
+        raise ProviderError(missing, hint)
 
 
 def have(cmd):
@@ -113,7 +141,8 @@ class OnePassword:
         return have("op")
 
     def _run(self, args, timeout=OP_TIMEOUT):
-        r = subprocess.run(["op", *args, "--format", "json"], capture_output=True, text=True, timeout=timeout)
+        r = run_tool(["op", *args, "--format", "json"], "1password-cli isn't installed", OP_INSTALL,
+                     capture_output=True, text=True, timeout=timeout)
         if r.returncode != 0:
             # op's stderr is prose (several lines of advice); the first
             # non-empty line is the actual error, minus its "[ERROR] <time>" stamp
@@ -132,9 +161,10 @@ class OnePassword:
 
     def ready(self):
         if not have("op"):
-            return False, "1password-cli isn't installed", "Install it with Komble (package 1password-cli)"
+            return False, "1password-cli isn't installed", OP_INSTALL
         try:
-            accts = self._run(["account", "list"], timeout=20)
+            # the app may ask to approve the CLI first: as long as any op call
+            accts = self._run(["account", "list"])
         except ProviderError as e:
             return False, e.error, e.hint
         except subprocess.TimeoutExpired:
@@ -179,14 +209,15 @@ class Bitwarden:
 
     def ready(self):
         if not have("rbw"):
-            return False, "rbw isn't installed", "Install rbw (Bitwarden CLI agent) with Komble and run `rbw login`"
+            return False, "rbw isn't installed", RBW_INSTALL
         r = subprocess.run(["rbw", "unlocked"], capture_output=True, text=True, timeout=10)
         if r.returncode != 0:
             return False, "Bitwarden vault is locked", "Run `rbw unlock` in a terminal"
         return True, "", ""
 
     def items(self):
-        r = subprocess.run(["rbw", "list", "--fields", "id,name,user,folder"], capture_output=True, text=True, timeout=60)
+        r = run_tool(["rbw", "list", "--fields", "id,name,user,folder"], "rbw isn't installed", RBW_INSTALL,
+                     capture_output=True, text=True, timeout=60)
         if r.returncode != 0:
             raise ProviderError((r.stderr or "rbw list failed").strip(), "Run `rbw unlock` in a terminal")
         items = []
@@ -207,7 +238,7 @@ class Bitwarden:
         if name is None:
             raise ProviderError("item not found", "")
         args = ["rbw", "get", "--raw", name] + ([user] if user else [])
-        r = subprocess.run(args, capture_output=True, text=True, timeout=60)
+        r = run_tool(args, "rbw isn't installed", RBW_INSTALL, capture_output=True, text=True, timeout=60)
         if r.returncode != 0:
             raise ProviderError((r.stderr or "rbw get failed").strip(), "")
         d = json.loads(r.stdout or "{}")
@@ -243,7 +274,8 @@ class PassStore:
         return items
 
     def secret(self, item_id):
-        r = subprocess.run(["pass", "show", item_id], capture_output=True, text=True, timeout=120)
+        r = run_tool(["pass", "show", item_id], "pass isn't installed", "Install pass and run `pass init`",
+                     capture_output=True, text=True, timeout=120)
         if r.returncode != 0:
             raise ProviderError((r.stderr or "pass show failed").strip(), "")
         lines = r.stdout.splitlines()
@@ -268,7 +300,8 @@ class EweSafe:
         return have("ewe-safe")
 
     def _run(self, args, timeout=SAFE_TIMEOUT):
-        r = subprocess.run(["ewe-safe", *args], capture_output=True, text=True, timeout=timeout)
+        r = run_tool(["ewe-safe", *args], "Safe isn't installed", SAFE_INSTALL,
+                     capture_output=True, text=True, timeout=timeout)
         try:
             d = json.loads(r.stdout or "null")
         except ValueError:
@@ -292,7 +325,7 @@ class EweSafe:
         """None when ready, else the ProviderError to report (kind "locked"
         when only an unlock is missing)."""
         if not self.installed():
-            return ProviderError("Safe isn't installed", "Install Safe (package ewe-safe) with Komble")
+            return ProviderError("Safe isn't installed", SAFE_INSTALL)
         try:
             st = self._run(["status"], timeout=10)
         except ProviderError as e:
@@ -382,6 +415,25 @@ def pick_provider():
 def fail_provider(p, e):
     """a ProviderError as the picker's JSON — kind "locked" is actionable"""
     fail(e.error, e.hint, kind=e.kind, provider=p.name, label=p.label)
+
+
+def cant_answer(p, error):
+    """the provider isn't there or can't reach its app — the kind of failure
+    another provider fixes (a locked vault or a declined prompt isn't)"""
+    if not p.installed():
+        return True
+    low = (error or "").lower()
+    if any(w in low for w in ("denied", "dismissed", "cancel", "locked")):
+        return False
+    return any(w in low for w in CANT_ANSWER)
+
+
+def offer_safe(p, error):
+    """{"use_safe": True} when Super+P could fill from Safe instead of a
+    provider that can't answer; {} otherwise"""
+    if p.name == "ewe" or not cant_answer(p, error):
+        return {}
+    return {"use_safe": True} if PROVIDERS[0].set_up() else {}
 
 
 def safe_only(verb):
@@ -543,6 +595,7 @@ def cmd_status():
         o["error"], o["hint"] = err, hint
         if p.name == "ewe":
             o["locked"] = getattr(p.check(), "kind", "") == "locked"
+        o.update(offer_safe(p, err))
     out(o)
 
 
@@ -577,8 +630,10 @@ def cmd_match(argv):
         items = cached_items(p, refresh="--refresh" in argv)
     except ProviderError as e:
         ok, err, hint = p.ready()      # a clearer reason than the raw CLI error, if there is one
-        fail(err if not ok and err else e.error, hint if not ok and hint else e.hint)
+        why = err if not ok and err else e.error
+        fail(why, hint if not ok and hint else e.hint, **offer_safe(p, why))
     except subprocess.TimeoutExpired:
+        # slow is not missing (an approval prompt can take a while): no offer
         fail("the password manager did not answer", "Unlock it and try again")
     res = score_items(items, wclass, title, arg(argv, "--query", ""), load_pins())
     if limit > 0:
@@ -701,6 +756,38 @@ def cmd_unlock():
     out({"ok": True, "provider": p.name, "items": d.get("items")})
 
 
+def plugin_tool():
+    """ewe-plugin: on PATH, else the deployed payload's"""
+    from shutil import which
+    for c in (which("ewe-plugin"), os.path.join(HOME, ".local", "share", "ewe", "bin", "ewe-plugin")):
+        if c and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def cmd_use_safe():
+    """Super+P fills from Safe from now on: the plugin's own `provider`
+    setting through `ewe-plugin set` (validated against manifest.json,
+    written through ewe-conf, live). Never `ewe-conf set` on the dotted id."""
+    safe = PROVIDERS[0]
+    if not safe.installed():
+        fail("Safe isn't installed", SAFE_INSTALL)
+    if not safe.set_up():
+        fail("No safe on this computer yet", "Open Safe to create one, or to open yours")
+    tool = plugin_tool()
+    hint = "Komble → Plugins → Passwords → Options… → Password manager: ewe"
+    if not tool:
+        fail("ewe-plugin isn't here to change the setting", hint)
+    try:
+        r = subprocess.run([tool, "set", PLUGIN_ID, "provider", "ewe"], capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        fail("ewe-plugin did not answer", hint)
+    if r.returncode != 0:
+        msg = (r.stderr or r.stdout or "").strip().splitlines()
+        fail(msg[-1] if msg else "ewe-plugin set failed", hint)
+    out({"ok": True, "provider": safe.name, "label": safe.label})
+
+
 def cmd_lock():
     p = safe_only("lock")
     try:
@@ -734,13 +821,14 @@ def main(argv):
             cmd_unlock()
         elif v == "lock":
             cmd_lock()
+        elif v == "use-safe":
+            cmd_use_safe()
         else:
-            fail("unknown verb %r" % v, code=2)
+            fail("unknown verb %r" % v)
     except SystemExit:
         raise
     except Exception as e:  # one JSON line, never a traceback, for the shell
         out({"ok": False, "error": str(e)})
-        return 1
     return 0
 
 
