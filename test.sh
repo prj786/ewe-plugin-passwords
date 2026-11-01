@@ -185,7 +185,7 @@ check "lock → ewe-safe lock" "echo '$r' | j 'assert d[\"ok\"] and d[\"locked\"
 st="$(./ewe-pass status)"
 check "locked: status says so (not ready, locked)" "echo '$st' | j 'assert d[\"provider\"]==\"ewe\" and d[\"ready\"] is False and d[\"locked\"] is True, d'"
 m="$(./ewe-pass match --class discord --title x || true)"
-check "locked: match → error locked, the sentence in message, provider named" "echo '$m' | j 'assert d[\"ok\"] is False and d[\"error\"]==\"locked\" and d[\"message\"]==\"Safe is locked\" and d[\"provider\"]==\"ewe\" and d[\"hint\"], d'"
+check "locked: match → error locked, the sentence in message, provider named" "echo '$m' | j 'assert d[\"ok\"] is False and d[\"error\"]==\"locked\" and d[\"message\"]==\"ewe Safe is locked\" and d[\"provider\"]==\"ewe\" and d[\"hint\"], d'"
 : > "$WTYPE_LOG"
 r="$(FAKE_PID=4242 ./ewe-pass fill 11111111-aaaa-4aaa-8aaa-111111111111 --pid 4242 || true)"
 check "locked: fill types nothing, says locked" "echo '$r' | j 'assert d[\"error\"]==\"locked\", d' && [ ! -s \"\$WTYPE_LOG\" ]"
@@ -196,9 +196,9 @@ check "unlock with another provider → a clear error" "echo '$r' | j 'assert d[
 export PATH="$OLDPATH"
 check "no ewe-safe on the test PATH (the real one never answers)" "! command -v ewe-safe >/dev/null"
 EWE_PASS_PROVIDER=ewe ./ewe-pass status > "$SB/st.json"     # (the message has an apostrophe)
-check "provider ewe without ewe-safe → install hint" "j 'assert d[\"ready\"] is False and d[\"error\"]==\"Safe isn\x27t installed\" and d[\"hint\"]==\"Install Safe (package ewe-safe) with Komble\", d' < '$SB/st.json'"
+check "provider ewe without ewe-safe → install hint" "j 'assert d[\"ready\"] is False and d[\"error\"]==\"ewe Safe isn\x27t installed\" and d[\"hint\"]==\"Install ewe Safe (package ewe-safe) with Komble\", d' < '$SB/st.json'"
 EWE_PASS_PROVIDER=ewe ./ewe-pass match --class x --title y > "$SB/m.json"
-check "match with provider ewe and no ewe-safe → the same, no traceback" "j 'assert d[\"ok\"] is False and d[\"hint\"]==\"Install Safe (package ewe-safe) with Komble\", d' < '$SB/m.json'"
+check "match with provider ewe and no ewe-safe → the same, no traceback" "j 'assert d[\"ok\"] is False and d[\"hint\"]==\"Install ewe Safe (package ewe-safe) with Komble\", d' < '$SB/m.json'"
 
 # 8. Super+P without 1Password: "Use Safe" when the provider can't answer --
 # op as on the owner's machine 2026-10-15: the app integration is gone

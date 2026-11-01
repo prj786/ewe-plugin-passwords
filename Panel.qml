@@ -131,7 +131,7 @@ Scope {
     }
     function showLocked() {
         items = []; matched = 0; selected = 0; locked = true
-        error = "Safe is locked — press Enter to unlock"; hint = ""
+        error = "ewe Safe is locked — press Enter to unlock"; hint = ""
     }
     function notify(title, body) { Quickshell.execDetached(["notify-send", "-a", "ewe", "-i", "dialog-password", title, body || ""]) }
 
@@ -201,7 +201,7 @@ Scope {
                 try { d = JSON.parse(this.text) } catch (e) { d = null }
                 if (d && d.ok) { root.resumeTarget = true; root.open = true; return }
                 if (d && d.error === "cancelled") return
-                root.notify("Safe is still locked", (d ? (d.message || d.error || "") : "no answer from ewe-pass") + (d && d.hint ? "\n" + d.hint : ""))
+                root.notify("ewe Safe is still locked", (d ? (d.message || d.error || "") : "no answer from ewe-pass") + (d && d.hint ? "\n" + d.hint : ""))
             }
         }
     }
@@ -215,14 +215,14 @@ Scope {
                 var d = null
                 try { d = JSON.parse(this.text) } catch (e) { d = null }
                 if (!d || !d.ok) {
-                    root.toast = "Couldn't switch to Safe" + (d && (d.message || d.error) ? ": " + (d.message || d.error) : "")
+                    root.toast = "Couldn't switch to ewe Safe" + (d && (d.message || d.error) ? ": " + (d.message || d.error) : "")
                     return
                 }
                 root.overrideOver = root.providerSetting
                 root.providerOverride = "ewe"
                 root.resumeTarget = true          // the same window, now from Safe
                 root.openPicker()
-                root.toast = "Super+P fills from Safe now"
+                root.toast = "Super+P fills from ewe Safe now"
             }
         }
     }
@@ -234,8 +234,8 @@ Scope {
             onStreamFinished: {
                 var d = null
                 try { d = JSON.parse(this.text) } catch (e) { d = null }
-                if (d && d.ok) { root.showLocked(); root.toast = "Safe locked" }
-                else root.toast = "Couldn't lock Safe"
+                if (d && d.ok) { root.showLocked(); root.toast = "ewe Safe locked" }
+                else root.toast = "Couldn't lock ewe Safe"
             }
         }
     }
@@ -428,7 +428,7 @@ Scope {
                             QsButton {
                                 anchors.horizontalCenter: parent.horizontalCenter
                                 visible: root.offerSafe
-                                label: "Use Safe"; ic: Theme.icLock; variant: "primary"; size: "sm"
+                                label: "Use ewe Safe"; ic: Theme.icLock; variant: "primary"; size: "sm"
                                 busy: root.switching; disabled: root.switching
                                 onGo: root.useSafe()
                             }
@@ -441,7 +441,7 @@ Scope {
                     width: parent.width
                     text: root.toast !== "" ? root.toast
                         : root.locked ? "Enter unlock · Esc close"
-                        : root.offerSafe ? "Enter use Safe for Super+P · Esc close"
+                        : root.offerSafe ? "Enter use ewe Safe for Super+P · Esc close"
                         : (root.matched > 0 ? root.matched + " for this app · " : "") + "Enter fill · Ctrl+Enter password · Ctrl+C user · Ctrl+Shift+C password · Ctrl+P pin"
                           + (root.provider === "ewe" ? " · Ctrl+L lock" : "")
                     color: Theme.textMuted; font.family: Theme.type.caption.family; font.pixelSize: Theme.type.caption.size

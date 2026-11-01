@@ -25,15 +25,15 @@ printed and never passed as arguments — they go to wtype / wl-copy on stdin.
   remember <id> [--class C]       pin an item to an app class; it sorts first
   forget <id> [--class C]
   unlock                          ewe Safe only: `ewe-safe unlock --ask` (the
-                                  login prompt, or the Safe window)
+                                  login prompt, or the ewe Safe window)
   lock                            ewe Safe only: `ewe-safe lock`
   use-safe                        make ewe Safe the provider: `ewe-plugin set
                                   ewe.passwords provider ewe` (the plugin's
                                   own setting, live). Needs a safe set up
 
 Providers (ewe.conf [passwords] provider = auto | ewe | 1password | bitwarden | pass):
-  ewe        ewe Safe, `ewe-safe` (docs/PROTOCOL.md in prj786/ewe-safe): Safe
-             does the matching, pins are app:<class> tags inside the safe (so
+  ewe        ewe Safe, `ewe-safe` (docs/PROTOCOL.md in prj786/ewe-safe): ewe
+             Safe does the matching, pins are app:<class> tags inside the safe (so
              they sync), secrets come from `reveal --json`, copy is the
              daemon's (it clears the clipboard). Locked → {"error": "locked"};
              the master password is never typed into the shell. `auto` picks
@@ -52,7 +52,7 @@ still finds it.
 
 When another provider can't answer at all (not installed, can't reach its
 app) and a safe is set up, `match` and `status` add "use_safe": true: the
-picker then offers "Use Safe", which runs `use-safe`.
+picker then offers "Use ewe Safe", which runs `use-safe`.
 """
 
 import json
@@ -75,7 +75,7 @@ UNLOCK_TIMEOUT = 300     # s — `unlock --ask` waits for the user
 PLUGIN_ID = "ewe.passwords"
 OP_INSTALL = "Install it with Komble (package 1password-cli)"
 RBW_INSTALL = "Install rbw (Bitwarden CLI agent) with Komble and run `rbw login`"
-SAFE_INSTALL = "Install Safe (package ewe-safe) with Komble"
+SAFE_INSTALL = "Install ewe Safe (package ewe-safe) with Komble"
 # a provider that says one of these can't answer at all — not installed,
 # not connected to its app, not signed in — as opposed to a locked vault, a
 # prompt the user turned down, or a slow answer: Safe is offered instead.
@@ -300,14 +300,14 @@ class EweSafe:
         return have("ewe-safe")
 
     def _run(self, args, timeout=SAFE_TIMEOUT):
-        r = run_tool(["ewe-safe", *args], "Safe isn't installed", SAFE_INSTALL,
+        r = run_tool(["ewe-safe", *args], "ewe Safe isn't installed", SAFE_INSTALL,
                      capture_output=True, text=True, timeout=timeout)
         try:
             d = json.loads(r.stdout or "null")
         except ValueError:
             d = None
         if not isinstance(d, dict):
-            raise ProviderError("ewe-safe gave no answer", "Reinstall Safe (package ewe-safe) with Komble")
+            raise ProviderError("ewe-safe gave no answer", "Reinstall ewe Safe (package ewe-safe) with Komble")
         if not d.get("ok"):
             raise ProviderError(d.get("message") or d.get("error") or "ewe-safe failed",
                                 d.get("hint") or "", kind=d.get("error") or "")
@@ -325,17 +325,17 @@ class EweSafe:
         """None when ready, else the ProviderError to report (kind "locked"
         when only an unlock is missing)."""
         if not self.installed():
-            return ProviderError("Safe isn't installed", SAFE_INSTALL)
+            return ProviderError("ewe Safe isn't installed", SAFE_INSTALL)
         try:
             st = self._run(["status"], timeout=10)
         except ProviderError as e:
             return e
         except subprocess.TimeoutExpired:
-            return ProviderError("Safe did not answer", "")
+            return ProviderError("ewe Safe did not answer", "")
         if not st.get("set_up"):
-            return ProviderError("No safe on this computer yet", "Open Safe to create one, or to open yours")
+            return ProviderError("No safe on this computer yet", "Open ewe Safe to create one, or to open yours")
         if st.get("locked"):
-            return ProviderError("Safe is locked", "Press Enter to unlock", kind="locked")
+            return ProviderError("ewe Safe is locked", "Press Enter to unlock", kind="locked")
         return None
 
     def ready(self):
@@ -409,7 +409,7 @@ def pick_provider():
     if safe.installed():
         return safe
     fail("no password manager CLI found",
-         "Install Safe (ewe-safe), 1password-cli (and connect it in the 1Password app), rbw, or pass")
+         "Install ewe Safe (ewe-safe), 1password-cli (and connect it in the 1Password app), rbw, or pass")
 
 
 def fail_provider(p, e):
@@ -622,7 +622,7 @@ def cmd_match(argv):
         except ProviderError as e:
             fail_provider(p, e)
         except subprocess.TimeoutExpired:
-            fail("Safe did not answer", "")
+            fail("ewe Safe did not answer", "")
         out({"ok": True, "provider": p.name, "label": p.label, "class": wclass or "", "title": title or "",
              "matched": sum(1 for r in res if r["score"] > 0), "items": res})
         return
@@ -752,7 +752,7 @@ def cmd_unlock():
     except ProviderError as e:
         fail_provider(p, e)
     except subprocess.TimeoutExpired:
-        fail("Safe is still locked", "The unlock prompt timed out")
+        fail("ewe Safe is still locked", "The unlock prompt timed out")
     out({"ok": True, "provider": p.name, "items": d.get("items")})
 
 
@@ -771,11 +771,11 @@ def cmd_use_safe():
     written through ewe-conf, live). Never `ewe-conf set` on the dotted id."""
     safe = PROVIDERS[0]
     if not safe.installed():
-        fail("Safe isn't installed", SAFE_INSTALL)
+        fail("ewe Safe isn't installed", SAFE_INSTALL)
     if not safe.set_up():
-        fail("No safe on this computer yet", "Open Safe to create one, or to open yours")
+        fail("No safe on this computer yet", "Open ewe Safe to create one, or to open yours")
     tool = plugin_tool()
-    hint = "Komble → Plugins → Passwords → Options… → Password manager: ewe"
+    hint = "Komble → Plugins → Passwords → Password manager: ewe"
     if not tool:
         fail("ewe-plugin isn't here to change the setting", hint)
     try:
